@@ -186,3 +186,41 @@ python3 super-agent/selftest.py        # 279 / 279 通过（新增 [26g-3] 21 �
                 "key": "@_user_1", "name": "杨晓辰(小德)"}]
   ```
   → 飞书认成了真提及（`key=@_user_1` 是飞书内部的提及占位键），对方会收到 @ 通知。
+
+---
+
+# 第四轮：降低 router 的思考等级（2026-11-19）
+
+## 一、为什么
+
+第一轮诊断出：router 决策轮 **32 秒**里，**23 秒是第一次工具调用之前的空转思考**
+（消息 → 事件注入 → 第一次调工具之间没有任何输出）。这段时间用户什么都看不到。
+
+根因是思考档位：pi 的会话记录里 `thinkingLevel = medium`。
+
+router 的职责是「语义判断 + 写 Decision」，不是长链推理任务 —— medium 太奢侈了。
+
+## 二、改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `router/model.json` | 新增 `thinking` 字段，默认 **`low`** |
+| `router.py` `PiSession.start()` | 启动 pi 时带 `--thinking <level>`；**启动后再用 RPC `set_thinking_level` 打一遍**（pi 恢复 session 时会把 session 里记录的老等级带回来，只靠启动参数不保险） |
+| `router.py` `set_model()` / `rotate()` | 换模型、轮转 session 后重打等级 |
+| `router.py` `sync_model()` | 配置里改了等级 → 运行中下一轮生效，不用重启 |
+| `router.py model --thinking <level>` | CLI 改等级（off\|minimal\|low\|medium\|high\|xhigh\|max），非法值直接报错 |
+| `router.py status` / `snapshot()` | 状态里带上 `thinking` / `thinking_level` |
+| `serve.py` `POST /api/router/model` | 也接受 `{"thinking": "low"}`（看板 UI 暂未接） |
+
+## 三、验证
+
+- `selftest.py` **299 / 299**（新增 `[26g-5]` 8 条断言）。
+- RPC 单独验证过：`set_thinking_level` 对 `low` / `medium` 都返回 `success: true`。
+- 重启后日志：`pi session 就绪：… model=MiniMax-M3.1-Flash thinking=low` +
+  `router 思考等级 → low`；`router.py status` 显示 `thinking: low`。
+
+## 四、注意
+
+- 只改了 **router**；worker 的思考等级没动（worker 干的是真活，需要推理）。
+- 效果要等**下一条真实消息**才能量到：看 pi 会话记录里的 `thinkingLevel`
+  从 `medium` 变成 `low`，以及决策轮里「第一次工具调用前的空转」是否明显缩短。

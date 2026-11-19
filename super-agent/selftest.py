@@ -1323,6 +1323,24 @@ def main() -> None:
               "### @ 某人：用 `mentions` 参数" in
               (pathlib.Path(__file__).resolve().parent / "skill" / "SKILL.md").read_text(encoding="utf-8"))
 
+        print("\n[26g-5] router 思考等级：可配、可运行中改")
+        import router as rt5
+        check("有思考等级常量与默认值", hasattr(rt5, "THINKING_LEVELS")
+              and rt5.DEFAULT_THINKING == "low", str(getattr(rt5, "DEFAULT_THINKING", "")))
+        _src5 = (pathlib.Path(__file__).resolve().parent / "router.py").read_text(encoding="utf-8")
+        check("启动 pi 时带 --thinking", '"--thinking", self.thinking' in _src5)
+        check("启动后再打一次等级（resume 会带回老等级）",
+              "self.apply_thinking()" in _src5 and "set_thinking_level" in _src5)
+        check("换模型 / 轮转 session 后重打等级",
+              _src5.count("self.apply_thinking()") >= 3, str(_src5.count("self.apply_thinking()")))
+        check("model 子命令能改思考等级",
+              "--thinking" in _src5 and "思考等级已设为" in _src5)
+        _mst5 = rt5.load_model_state()
+        check("model.json 记着当前等级", bool(_mst5.get("thinking")), str(_mst5.get("thinking")))
+        check("等级取值合法", (mst5 := _mst5.get("thinking")) in rt5.THINKING_LEVELS, str(mst5))
+        _srv5 = (pathlib.Path(__file__).resolve().parent / "serve.py").read_text(encoding="utf-8")
+        check("看板接口也能改等级", '"thinking"' in _srv5 and "THINKING_LEVELS" in _srv5)
+
         print("\n[26h] 事件带说话人/渠道/话题 + 链式派工上限 + worker prompt 内联")
         import router as rt4
         ev_u = {"kind": "user.message", "id": "trig-s", "text": "看下审批",

@@ -679,7 +679,27 @@ router 用**一个统一的长驻 session**（`super-agent-router`），所有�
 python3 super-agent/router.py model --status              # 看当前/主模型/降级状态
 python3 super-agent/router.py model <provider/model>      # 切到指定模型
 python3 super-agent/router.py model --restore             # 切回启动默认模型
+python3 super-agent/router.py model --thinking low        # 改思考等级（运行中生效）
 ```
+
+## Router 的思考等级
+
+router 只做「语义判断 + 写 Decision」，**不是长链推理任务**。
+高思考档实测会在第一次工具调用前**空转 23 秒**（用户全程看不到任何反馈），
+所以默认用 `low`。
+
+```bash
+python3 super-agent/router.py model --thinking low      # off|minimal|low|medium|high|xhigh|max
+python3 super-agent/router.py model --status             # 看当前等级
+```
+
+- 等级记在 `model.json` 的 `thinking` 字段（默认 `low`）；
+- 启动 pi 时用 `--thinking <level>`，**并且启动后再用 RPC `set_thinking_level` 打一遍** ——
+  pi 恢复 session 时会把 session 里记录的老等级带回来，只靠启动参数不保险；
+- 换模型、轮转 session 后同样重打；
+- 看板接口 `POST /api/router/model` 也接受 `{"thinking": "low"}`（UI 暂未接）。
+
+> 基线：改之前是 `medium`。改完之后 pi 的会话记录里 `thinkingLevel` 会变成 `low`。
 
 三个模型来源，优先级从高到低：
 

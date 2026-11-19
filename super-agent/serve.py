@@ -496,13 +496,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
                 return
             if path == "/api/router/model":
-                # 切 router 的模型：写 model.json，运行中的 router 下一轮生效
+                # 切 router 的模型 / 思考等级：写 model.json，运行中的 router 下一轮生效
                 model = (payload.get("model") or "").strip()
                 restore = bool(payload.get("restore"))
+                thinking = (payload.get("thinking") or "").strip().lower()
                 if router_mod is None:
                     self._json({"error": "router 模块不可用"}, 500)
                     return
                 st = router_mod.load_model_state()
+                if thinking:
+                    if thinking not in router_mod.THINKING_LEVELS:
+                        self._json({"error": "思考等级要写成 off|minimal|low|medium|high|xhigh|max"}, 400)
+                        return
+                    st["thinking"] = thinking
                 if restore:
                     target = st.get("boot_primary") or "minimax-cn/MiniMax-M3.1-Flash"
                 elif model:
@@ -510,15 +516,18 @@ class Handler(BaseHTTPRequestHandler):
                         self._json({"error": "模型要写成 provider/model"}, 400)
                         return
                     target = model
-                else:
-                    self._json({"error": "model 或 restore 必填"}, 400)
+                elif not thinking:
+                    self._json({"error": "model / thinking / restore 至少给一个"}, 400)
                     return
+                else:
+                    target = st.get("primary") or "minimax-cn/MiniMax-M3.1-Flash"
                 st["primary"] = target
                 st["degraded"] = False
                 st["degraded_to"] = ""
                 st["degraded_at"] = ""
                 router_mod.save_model_state(st)
                 self._json({"ok": True, "primary": target,
+                            "thinking": st.get("thinking") or router_mod.DEFAULT_THINKING,
                             "hint": "运行中的 router 下一轮生效"})
                 return
             if path == "/api/policy/grant":

@@ -53,14 +53,27 @@ FALLBACK_MODELS = (
 # 运行时模型状态（文件驱动 —— 改它，运行中的 router 下一轮就会跟着切）
 MODEL_FILE = ROUTER_DIR / "model.json"
 DEFAULT_MODEL = "minimax-cn/MiniMax-M3.1-Flash"
+# router 的思考等级（thinking level）——
+# router 只做「语义判断 + 写 Decision」，不是长链推理任务；
+# 高思考档实测会在第一次工具调用前空转 23 秒（用户全程看不到东西）。
+# low 是平衡点：明显提速，判断质量基本不掉。
+DEFAULT_THINKING = "low"
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 # 降级后多久尝试自动切回主模型（秒）
 RESTORE_AFTER = int(os.environ.get("SA_ROUTER_RESTORE_AFTER", "300"))
+
+
+def thinking_level() -> str:
+    """当前生效的思考等级（model.json 的 thinking 字段）。"""
+    lv = str(load_model_state().get("thinking") or DEFAULT_THINKING).strip().lower()
+    return lv if lv in THINKING_LEVELS else DEFAULT_THINKING
 
 
 def load_model_state() -> dict:
     """读运行时模型状态。"""
     st = {"primary": DEFAULT_MODEL, "boot_primary": DEFAULT_MODEL, "active": "",
           "degraded": False, "degraded_to": "", "degraded_at": "",
+          "thinking": DEFAULT_THINKING,
           "restore_after_seconds": RESTORE_AFTER}
     if MODEL_FILE.exists():
         try:
@@ -198,6 +211,7 @@ class PiSession:
         self.last_assistant = ""
         self.last_error = ""
         self.model = load_model_state().get("primary") or os.environ.get("SA_ROUTER_MODEL", DEFAULT_MODEL)
+        self.thinking = thinking_level()
         self.started_at = ""
         self.session_name = "Super Agent Router"
         self._id = 0
@@ -206,6 +220,9 @@ class PiSession:
     def start(self) -> None:
         mst = load_model_state()
         self.model = mst.get("primary") or os.environ.get("SA_ROUTER_MODEL", DEFAULT_MODEL)
+        self.thinking = str(mst.get("thinking") or DEFAULT_THINKING).strip().lower()
+        if self.thinking not in THINKING_LEVELS:
+            self.thinking = DEFAULT_THINKING
         # 会话名带上开启时间 —— `pi --resume` 的会话列表按 display name 展示，
         # 名字固定的话历次会话长得一模一样，分不清哪次是哪次。
         self.started_at = now()
@@ -215,6 +232,9 @@ class PiSession:
             "--session-id", self.session_id,
             "--name", self.session_name,
             "--model", self.model,
+            # 思考等级：router 只做语义判断，不需要长链推理；
+            # 高档位实测会在第一次工具调用前空转 23 秒。
+            "--thinking", self.thinking,
             "--append-system-prompt", str(SYSTEM_PROMPT_FILE),
             # 工具最小集：只读任务上下文 + 写 Decision 草稿 + 调 Task Center。
             # grep/find/ls 等探索工具一律不给 —— router 不做调查。
@@ -236,7 +256,8 @@ class PiSession:
         while time.time() < deadline:
             try:
                 st = self.request("get_state", timeout=30)
-                log(f"pi session 就绪：{(st or {}).get('sessionId')} model={(st or {}).get('model',{}).get('id')}")
+                log(f"pi session 就绪：{(st or {}).get('sessionId')} model={(st or {}).get('model',{}).get('id')}"
+                    f" thinking={self.thinking}")
                 break
             except Exception:
                 time.sleep(1)
@@ -247,6 +268,9 @@ class PiSession:
             self.snapshot()
         except Exception:
             pass
+        # 启动后**再打一次**思考等级：pi 恢复 session 时会把 session 里记录的老等级
+        # 带回来（“Resuming the session restores them”），只靠启动参数不保险。
+        self.apply_thinking()
 
     def rotate(self) -> bool:
         """轮转 session —— 清空上下文，重新开始。
@@ -259,11 +283,25 @@ class PiSession:
             self.request("new_session", timeout=60)
             self.request("set_model", timeout=60,
                          provider=self.model.split("/")[0], modelId=self.model.split("/")[-1])
-            log("session 已轮转（上下文清零）")
+            # 轮转会沿用 session 里记录的思考等级 → 重新按配置打一遍
+            self.apply_thinking()
+            log(f"session 已轮转（上下文清零，thinking={self.thinking}）")
             return True
         except Exception as e:
             log(f"session 轮转失败：{e}")
             return False
+
+    def apply_thinking(self) -> None:
+        """把思考等级打到当前 session 上（运行中生效）。
+
+        为什么要单独打一遍：pi 的 session 会**记住**上次的思考等级，
+        恢复 session 时会把老等级带回来 —— 不重打就等于改了配置也没用。
+        """
+        try:
+            self.request("set_thinking_level", timeout=30, level=self.thinking)
+            log(f"router 思考等级 → {self.thinking}")
+        except Exception as e:
+            log(f"设置思考等级失败（{self.thinking}）：{str(e)[:120]}")
 
     def _drain_stderr(self) -> None:
         try:
@@ -354,6 +392,7 @@ class PiSession:
         mst = load_model_state()
         info["model_configured"] = self.model
         info["model_primary"] = mst.get("primary")
+        info["thinking_level"] = self.thinking
         info["model_degraded"] = bool(mst.get("degraded"))
         info["model_degraded_to"] = mst.get("degraded_to") or ""
         info["fallback_models"] = list(FALLBACK_MODELS)
@@ -408,6 +447,13 @@ class PiSession:
         st = load_model_state()
         primary = st.get("primary") or DEFAULT_MODEL
         degraded = bool(st.get("degraded"))
+        # 思考等级改了也要跟着生效（不必重启）
+        want_thinking = str(st.get("thinking") or DEFAULT_THINKING).strip().lower()
+        if want_thinking not in THINKING_LEVELS:
+            want_thinking = DEFAULT_THINKING
+        if want_thinking != self.thinking:
+            self.thinking = want_thinking
+            self.apply_thinking()
         cooled = True
         if degraded:
             try:
@@ -461,6 +507,8 @@ class PiSession:
             provider, _, mid = model.partition("/")
             self.request("set_model", timeout=30, provider=provider, modelId=mid)
             self.model = model
+            # 换模型后思考等级可能被重置 → 重打一遍
+            self.apply_thinking()
             log(f"router 已切换到模型 {model}")
         except Exception as e:
             log(f"切换模型失败 {model}: {e}")
@@ -938,16 +986,27 @@ def cmd_rotate(a: argparse.Namespace) -> None:
 
 
 def cmd_model(a: argparse.Namespace) -> None:
-    """切换 router 的模型（运行中的 router 下一轮就会生效，不用重启）。
+    """切换 router 的模型 / 思考等级（运行中的 router 下一轮就会生效，不用重启）。
 
         router.py model <provider/model>   # 切到指定模型
         router.py model --restore          # 切回启动默认模型（降级后用这个）
         router.py model --status           # 看当前/主/降级状态
         router.py model --degraded-to <m>  # 直接指定降级目标（备用）
+        router.py model --thinking low     # 改思考等级（off|minimal|low|medium|high|xhigh|max）
     """
     st = load_model_state()
     if a.status:
         print(json.dumps(st, ensure_ascii=False, indent=2))
+        return
+    if a.thinking:
+        lv = str(a.thinking).strip().lower()
+        if lv not in THINKING_LEVELS:
+            print(f"思考等级要写成 {'|'.join(THINKING_LEVELS)}（收到 {a.thinking}）",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        st["thinking"] = lv
+        save_model_state(st)
+        print(f"思考等级已设为 {lv}（运行中的 router 下一轮生效）")
         return
     if a.restore:
         target = st.get("boot_primary") or os.environ.get("SA_ROUTER_MODEL") or DEFAULT_MODEL
@@ -1063,6 +1122,7 @@ def cmd_status(a: argparse.Namespace) -> None:
         "model": {"primary": mst.get("primary"), "active": mst.get("active"),
                   "degraded": mst.get("degraded"), "degraded_to": mst.get("degraded_to"),
                   "degraded_at": mst.get("degraded_at"),
+                  "thinking": mst.get("thinking") or DEFAULT_THINKING,
                   "fallback_models": list(FALLBACK_MODELS)},
         "repo": str(REPO), "inbox_events": inbox, "router_decisions": outbox,
         "session_messages": sess_msgs,
@@ -1123,6 +1183,8 @@ def main() -> None:
     p.add_argument("--restore", action="store_true", help="切回启动默认模型")
     p.add_argument("--status", action="store_true", help="只看状态")
     p.add_argument("--degraded-to", default="", help="把降级目标改成指定模型")
+    p.add_argument("--thinking", default="",
+                   help="思考等级：off|minimal|low|medium|high|xhigh|max")
     p.set_defaults(func=cmd_model)
 
     p = sub.add_parser("rotate", help="手动轮转 session（归档当前会话，重开干净的；连续性靠 digest.md）")

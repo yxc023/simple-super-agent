@@ -975,6 +975,144 @@ def _stage_ts(a: dict, stage: str) -> str:
     return (a.get("dispatched_at") if stage == "dispatched" else a.get("completed_at")) or ""
 
 
+# ── 没有派单 → 直接标完成 ─────────────────────────────────────────────
+# router 每处理完一轮，会往 router/outbox.jsonl 写一条（含原事件与它的回复）。
+# 由��可以判断「这条消息 router 已经处理完了」。
+NO_DISPATCH_GRACE_SECONDS = 45      # router 回复后等一会儿再判，避免抢在 Decision 之前
+NO_DISPATCH_WINDOW_HOURS = 6        # 只回溯这个时间窗内的消息，不去动历史旧消息
+
+
+def _router_reply_records(limit: int = 200) -> list[dict]:
+    """router 处理过的消息（读 router/outbox.jsonl 尾部）。"""
+    p = sa.ROUTER_DIR / "outbox.jsonl"
+    if not p.exists():
+        return []
+    out = []
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except OSError:
+        return []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _decision_items(trigger: str) -> list | None:
+    """某个 trigger 的 Decision 派工条目；没有决策文件返回 None。"""
+    if not trigger:
+        return None
+    p = sa.ROUTER_DIR / "decisions" / f"{trigger}.json"
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    sub = d.get("submitted") or {}
+    items = sub.get("items") if isinstance(sub, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _dispatched_message_ids() -> set:
+    """已经派过工的消息 id（指派的 origin_ref，缺了回落任务来源）。"""
+    out = set()
+    try:
+        tids = sa.list_task_ids()
+    except Exception:
+        tids = []
+    for tid in tids:
+        try:
+            tstate = sa.load_state(tid)
+        except Exception:
+            continue
+        src = tstate.get("source_ref") or {}
+        for a in tstate.get("assignments") or []:
+            origin = a.get("origin_ref") or {}
+            mid = origin.get("message_id") or src.get("message_id") or ""
+            if mid:
+                out.add(str(mid))
+    return out
+
+
+def _clear_done_reaction(message_id: str) -> None:
+    """把之前误标的「完成」表情撤掉（用于抢跑后又真的派了工的情况）。"""
+    try:
+        for r in _own_reactions(list_reactions(message_id)):
+            if (r.get("reaction_type") or {}).get("emoji_type") == "DONE":
+                delete_reaction(message_id, r.get("reaction_id") or "")
+    except Exception as e:
+        log(f"撤完成表情失败 {message_id}：{str(e)[:140]}")
+
+
+def sync_no_dispatch_reactions() -> int:
+    """**没有派单的消息** → 表情直接标成「完成」。
+
+    场景：router 看完这条消息决定「不用派 worker」（自己回一句话就行）。
+    这时消息上会一直挂着 ⌨️（收到时的表情），看着像卡住了 ——
+    实际上这一轮已经结束了，应该直接落 ✅。
+
+    判定条件（三条都满足才标）：
+      1. router 已经处理过这条消息（router/outbox.jsonl 里有它的回复记录）；
+      2. 过了宽限期（默认 45s），给 Decision 落地留时间；
+      3. 这条消息**没有任何派工**（既没有 Decision 派工条目，也没有指派落到它身上）。
+    """
+    rc = reaction_config()
+    if not rc.get("enabled"):
+        return 0
+    st = load_state()
+    done_map = st.get("no_dispatch_done")
+    if not isinstance(done_map, dict):
+        done_map = {}
+    now_ts = time.time()
+    added = 0
+    dispatched = None      # 懒加载：消息多的时候不用每次都扫全部任务
+    for rec in _router_reply_records():
+        ev = rec.get("event") or {}
+        if not isinstance(ev, dict) or (ev.get("kind") or "") != "user.message":
+            continue
+        ref = ev.get("source_ref") or {}
+        mid = str(ref.get("message_id") or "")
+        if not mid or mid in done_map:
+            continue
+        # ① router 处理完了吗（回复记录里有）
+        # ② 宽限期过了吗
+        try:
+            ts = _dt.datetime.fromisoformat(str(rec.get("ts") or "")).timestamp()
+        except (ValueError, TypeError):
+            continue
+        if now_ts - ts < NO_DISPATCH_GRACE_SECONDS:
+            continue
+        if now_ts - ts > NO_DISPATCH_WINDOW_HOURS * 3600:
+            continue                      # 太旧了，不去翻历史消息的表情
+        # ③ 真的没派工吗
+        trigger = str(ev.get("id") or "")
+        items = _decision_items(trigger)
+        if items:
+            continue                      # 派了工 → 走派发/完成那套表情
+        if dispatched is None:
+            dispatched = _dispatched_message_ids()
+        if mid in dispatched:
+            continue                      # 已经派过工（Decision 还没落盘的情况）
+        if react(mid, rc.get("completed") or "DONE"):
+            added += 1
+            log(f"无派单 → 直接标完成：{mid}")
+        done_map[mid] = {"ts": sa.now(), "trigger": trigger}
+    if done_map:
+        st["no_dispatch_done"] = done_map
+        save_state(st)
+    return added
+
+
 def sync_reactions() -> int:
     """按指派状态补表情：派发 🎆 / 完成 ✅。
 
@@ -1024,6 +1162,13 @@ def sync_reactions() -> int:
             mid = origin.get("message_id") or src.get("message_id") or ""
             if not mid:
                 continue
+            # 这条消息之前被标过「无派单 → 完成」，现在真的派了工：
+            # 撤掉那个 ✅，让派发表情能正常挂上去
+            done_map = st.get("no_dispatch_done")
+            if isinstance(done_map, dict) and mid in done_map:
+                _clear_done_reaction(str(mid))
+                done_map.pop(mid, None)
+                st["no_dispatch_done"] = done_map
             if react(mid, rc[stage]):
                 added += 1
     st["reaction_seen"] = seen
@@ -1492,6 +1637,10 @@ def cmd_follow(a: argparse.Namespace) -> None:
                 sync_reactions()
             except Exception as e:
                 log(f"表情同步异常: {e}")
+            try:
+                sync_no_dispatch_reactions()
+            except Exception as e:
+                log(f"无派单表情同步异常: {e}")
             time.sleep(5)
 
     threading.Thread(target=deliver_loop, daemon=True).start()
@@ -1626,6 +1775,7 @@ def cmd_pull(a: argparse.Namespace) -> None:
                         save_state(state)
                         deliver_outbox()          # 顺带投递待发消息
                         sync_reactions()          # 顺带补表情（派发/完成）
+                        sync_no_dispatch_reactions()   # 没派单的直接标完成
                 except Exception as e:
                     log(f"轮询异常: {e}")
                 time.sleep(cfg.get("poll", {}).get("interval_seconds", 20))

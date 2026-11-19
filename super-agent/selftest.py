@@ -1031,6 +1031,73 @@ def main() -> None:
         src7b = (pathlib.Path(__file__).resolve().parent / "sa.py").read_text(encoding="utf-8")
         check("指派记录触发它的那条用户消息", "origin_ref" in src7b)
 
+        print("\n[26g-2] 没有派单 → 表情直接标完成（不一直挂着敲键盘）")
+        import lark_bridge as lb2
+        import datetime as _dt2
+        lb_state_file, lb_log_file = lb2.STATE_FILE, lb2.LOG_FILE
+        lb2.STATE_FILE = tmp / "nodispatch_state.json"
+        lb2.LOG_FILE = tmp / "nodispatch_bridge.log"
+        _calls = []
+        _orig_react = lb2.react
+        lb2.react = lambda mid, emoji: (_calls.append((mid, emoji)), True)[1]
+        try:
+            def _reply(mid, trig, offset=-120):
+                ev = {"id": trig, "kind": "user.message",
+                      "source_ref": {"message_id": mid, "chat_id": "oc_" + "a" * 32,
+                                     "chat_type": "p2p"}}
+                ts = _dt2.datetime.now().astimezone() + _dt2.timedelta(seconds=offset)
+                p = sa.ROUTER_DIR / "outbox.jsonl"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with p.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"ts": ts.isoformat(timespec="seconds"),
+                                        "event": ev, "router": "收到"}, ensure_ascii=False) + "\n")
+
+            def _decision(trig, items):
+                p = sa.ROUTER_DIR / "decisions" / f"{trig}.json"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps({"submitted": {"triggerId": trig, "items": items}},
+                                        ensure_ascii=False), encoding="utf-8")
+
+            _reply("om_nd_1", "trig_nd_1")
+            lb2.sync_no_dispatch_reactions()
+            check("没有决策文件（router 决定不派工）→ 标完成",
+                  _calls == [("om_nd_1", "DONE")], str(_calls))
+            _calls.clear()
+
+            _reply("om_nd_2", "trig_nd_2")
+            _decision("trig_nd_2", [{"taskAction": "create", "agentId": "general-purpose"}])
+            lb2.sync_no_dispatch_reactions()
+            check("决策里有派工条目 → 不标完成", _calls == [], str(_calls))
+            _calls.clear()
+
+            _reply("om_nd_3", "trig_nd_3")
+            _decision("trig_nd_3", [])
+            lb2.sync_no_dispatch_reactions()
+            check("决策派工为空 → 标完成", _calls == [("om_nd_3", "DONE")], str(_calls))
+            _calls.clear()
+
+            lb2.sync_no_dispatch_reactions()
+            check("同一消息不重复标（幂等）", _calls == [], str(_calls))
+
+            _reply("om_nd_4", "trig_nd_4", offset=-5)
+            lb2.sync_no_dispatch_reactions()
+            check("宽限期内不标（等 Decision 落地）", _calls == [], str(_calls))
+            _calls.clear()
+
+            _reply("om_nd_5", "trig_nd_5")
+            _td = sa.TASKS_DIR / "T901"
+            (_td / "context").mkdir(parents=True, exist_ok=True)
+            (_td / "state.json").write_text(json.dumps({
+                "task_id": "T901", "title": "t", "goal": "g", "status": "open",
+                "source_ref": {"message_id": "om_nd_5"},
+                "assignments": [{"id": "A01", "worker": "general-purpose", "status": "assigned"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            lb2.sync_no_dispatch_reactions()
+            check("已经有指派落到这条消息 → 不标完成", _calls == [], str(_calls))
+        finally:
+            lb2.react = _orig_react
+            lb2.STATE_FILE, lb2.LOG_FILE = lb_state_file, lb_log_file
+
         print("\n[26h] 事件带说话人/渠道/话题 + 链式派工上限 + worker prompt 内联")
         import router as rt4
         ev_u = {"kind": "user.message", "id": "trig-s", "text": "看下审批",

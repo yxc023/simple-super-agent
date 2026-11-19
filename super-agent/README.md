@@ -822,6 +822,7 @@ python3 super-agent/invariants.py --strict   # WARN 也算失败
 | 接收任务 | ⌨️ | `Typing` | 消息投给 router 的瞬间 |
 | 分配任务 | 💭 | `Status_PrivateMessage` | 指派派出去（assignment → assigned/running） |
 | 完成任务 | ✅ | `DONE` | 指派完成 / 放行 |
+| **没有派单** | ✅ | `DONE` | router 处理完这条消息但**没有派任何 worker**（自己回一句话就结束了） |
 
 > 分配用的是**蓝色气泡三个点**那个（`Status_PrivateMessage`）——
 > Feishu 里 `THINKING` 是「思考」的脸，不是「思考中」。
@@ -850,6 +851,24 @@ python3 super-agent/invariants.py --strict   # WARN 也算失败
 
 去重靠桥接状态里的 `reaction_seen`（指派 → 上次看到的阶段）；
 首次看到某个指派时只有「10 分钟内刚发生」才补表情，不给历史活倒灌。
+
+### 没有派单 → 直接标完成
+
+router 看完一条消息后可能决定「不用派 worker」（自己回一句话、回答状态查询、
+重复触发去重……）。这类消息如果只挂着 ⌨️，看起来像机器人卡住了 —— 实际上这一轮
+早就结束了。所以桥接会把它直接换成 ✅。
+
+判定（`sync_no_dispatch_reactions()`，三个条件都满足才标）：
+
+1. router 已经处理过这条消息 —— `router/outbox.jsonl` 里有它这一轮的回复记录；
+2. 过了宽限期（默认 45s，给 Decision 落地留时间），且在回溯窗口内（默认 6 小时）；
+3. 这条消息**确实没有派工**：既没有 Decision 派工条目，也没有任何指派落在它身上
+   （`assignment.origin_ref.message_id` / 任务 `source_ref.message_id`）。
+
+台账在 `lark_state.json` 的 `no_dispatch_done`，天然幂等。
+
+> 抢跑保护：如果先标了 ✅、之后又真的派了工（Decision 晚到），
+> 下一轮扫描会**先撤掉那个 ✅** 再挂 💭 —— 否则「完成是终态」的规则会把派发表情挡住。
 
 ## 话题 ID 什么时候有
 

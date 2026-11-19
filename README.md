@@ -1,6 +1,6 @@
 # simple-super-agent
 
-一个**只做调度、不做执行**的多 agent 协作框架（Super Agent）。
+一个**基于文件存储**做**任务管理与分发**的 super agent。
 
 - 架构与协议的完整说明： [`super-agent/README.md`](./super-agent/README.md)
 - 配置与本地化： [`docs/configuration.md`](./docs/configuration.md)
@@ -11,13 +11,29 @@
 一个常驻的 **router session**（主 agent）负责接收指令、判断意图、拆成指派，
 把指派交给**只执行不判断**的 worker agent；worker 的回执再由 router 核对后放行或打回。
 
+**任务管理与分发全程基于文件存储**：没有数据库、没有常驻服务端的内存状态，
+任务、指派、回执、事件、外发消息全是文件，**文件就是状态机**。
+
 ```
 用户消息 ──► router（判断） ──► Task Center（校验/落地） ──► worker（执行）
                 ▲                                            │
                 └────────── 回执 + 人工干预 ◄────────────────┘
 ```
 
-关键设计是**用机制而不是提示词来约束角色**：
+一次任务的全部状态都落在一个目录里，人能直接看、能直接改、能进 git：
+
+```
+tasks/T875/
+├── task.md        # 任务定义（目标、上下文、验收标准）
+├── state.json     # 机器可读状态（唯一事实源）
+├── events.jsonl   # 事件流（谁在什么时候做了什么）
+└── context/       # 上下文文件副本（worker 只读这里）
+channels/T875/
+├── instructions/A01.md   # 指派单（派给 worker 的东西）
+└── responses/A01.md      # 回执（worker 写回）
+```
+
+因此：
 
 | 角色 | 约束手段 |
 | --- | --- |
@@ -25,6 +41,14 @@
 | worker | `registry.json` 是名册唯一真源：是否在册、是否启用、是否只读、并发上限，派工前由 Task Center 校验；只读 worker 由机制强制，不靠 prompt 自觉 |
 | 触发闸门 | 某些 worker 带 `trigger_gate`（例如只允许 owner 私聊触发），由 Task Center 校验 Decision 里的 `requester`，闸门不符直接拒派 |
 | 状态 | 全部落文件（`tasks/` `channels/` `outbox/`），CLI、看板、agent 三方读写同一套文件 |
+
+### 为什么用文件存
+
+- **可审计**：每一次派工、放行、投递都有 `events.jsonl` 流水，出了问题能按时间线倒查。
+- **可手工干预**：看板上能改的东西，都能在文件里直接改（`state.json` / `notes/`）——
+  没有隐藏的内存状态要同步。
+- **零基础设施**：不装数据库、不跑迁移；`git clone` 完就能跑。
+- **三方同源**：router、worker、看板、CLI 读写的是同一批文件，不存在「两份状态对不上」。
 
 ## 目录结构
 

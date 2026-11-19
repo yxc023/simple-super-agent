@@ -1,12 +1,34 @@
 # super-agent — 指令调度层
 
-一个**只接指令、不亲自干活**的调度 agent。
+一个**基于文件存储**做**任务管理与分发**的 super agent。
 
 它接收人的指令，把「指令 + 上下文」拆成可独立执行的指派（assignment），
 交给其他 worker agent 去执行，然后只负责收回执、汇总、转述。
 
+**任务管理与分发全程基于文件存储**：没有数据库、没有服务端内存状态，
+任务、指派、回执、事件、外发消息全是文件 —— **文件就是状态机**，
+router / worker / 看板 / CLI 读写的是同一批文件。
+
 > 边界：super agent **不**做业务执行、不替 worker 下结论、不改业务代码。
 > 它只做四件事：建任务 → 派指派 → 收回执 → 汇总。
+
+## 任务与分发的落盘位置
+
+| 东西 | 落哪 | 谁写 |
+| --- | --- | --- |
+| 任务定义 | `tasks/<id>/task.md` | Task Center |
+| 任务状态（唯一事实源） | `tasks/<id>/state.json` | Task Center |
+| 任务时间线 | `tasks/<id>/events.jsonl` | 全链路追加 |
+| 上下文包 | `tasks/<id>/context/` | Task Center 拷给 worker |
+| 指派单 | `channels/<id>/instructions/A0x.md` | Task Center |
+| 回执 | `channels/<id>/responses/A0x.md` | worker 写回 |
+| 人工干预 | `channels/<id>/notes/` | 人 / 看板 |
+| 外发消息队列 | `outbox/ob_*.json` | Task Center 建、投递器发 |
+| Worker 名册 | `registry.json` | 人 / 看板 |
+| router 收件箱 / 决策 | `router/inbox.jsonl`、`router/decisions/` | router |
+
+「建任务 → 派指派 → 收回执 → 汇总」这四步全部是对这些文件的读写，
+没有别的存储。
 
 ## 目录布局
 

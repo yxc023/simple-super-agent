@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "note": "Worker Registry —— 派工前由 sa.py 校验：agent_id 必须在册、enabled、并发未超。只读 worker 由 registry 强制（不仅靠 prompt）。",
+  "defaults": {
+    "max_parallel": 2,
+    "timeout_seconds": 1800
+  },
+  "workers": [
+    {
+      "agent_id": "explore",
+      "label": "调查",
+      "enabled": true,
+      "readonly": true,
+      "capabilities": ["read", "search", "trace", "summarize"],
+      "max_parallel": 2,
+      "role_prompt": "你是 explore worker：只读。绝对不要修改、创建、删除任何业务文件；只做调查与梳理，产出写成新的 md 文件。产出与回执中不要出现：同事姓名/工号/uid、他人或群的消息内容、内部接口与域名、内部工单号/计划号、内部仓库名与库表名、SQL 片段；需要细节就写进产出文件，由用户自己打开。",
+      "accepts": ["摸清现状", "定位实现", "梳理调用链", "列清单"]
+    },
+    {
+      "agent_id": "plan",
+      "label": "方案",
+      "enabled": true,
+      "readonly": true,
+      "capabilities": ["read", "design", "plan"],
+      "max_parallel": 1,
+      "role_prompt": "你是 plan worker：只读。绝对不要修改、创建、删除任何业务文件；只输出方案文档。产出与回执中不要出现：同事姓名/工号/uid、他人或群的消息内容、内部接口与域名、内部工单号/计划号、内部仓库名与库表名、SQL 片段；需要细节就写进产出文件，由用户自己打开。",
+      "accepts": ["怎么改", "设计实现", "根因分析", "对比方案"]
+    },
+    {
+      "agent_id": "general-purpose",
+      "label": "实现",
+      "enabled": true,
+      "readonly": false,
+      "capabilities": ["read", "edit", "write", "run", "test"],
+      "max_parallel": 2,
+      "role_prompt": "你是 general-purpose worker：可以按指派单改动文件，但改动范围必须严格限定在指派单里。产出与回执中不要出现：同事姓名/工号/uid、他人或群的消息内容、内部接口与域名、内部工单号/计划号、内部仓库名与库表名、SQL 片段；需要细节就写进产出文件，由用户自己打开。",
+      "accepts": ["实现功能", "修 bug", "跑数据", "跑测试", "写文档"]
+    },
+    {
+      "agent_id": "research",
+      "label": "调研",
+      "enabled": false,
+      "readonly": true,
+      "capabilities": ["read", "search", "web"],
+      "max_parallel": 1,
+      "disabled_reason": "pi CLI 未配置联网检索工具，派出去等于没有角色约束的默认 worker。先在 registry 打开并配好工具。",
+      "role_prompt": "你是 research worker：只读，负责联网检索与外部事实核实，结论必须带来源链接。产出与回执中不要出现：同事姓名/工号/uid、他人或群的消息内容、内部接口与域名、内部工单号/计划号、内部仓库名与库表名、SQL 片段；需要细节就写进产出文件，由用户自己打开。",
+      "accepts": ["查行业资料", "核实外部事实"]
+    },
+    {
+      "agent_id": "daily-news",
+      "label": "早读",
+      "enabled": true,
+      "readonly": false,
+      "capabilities": ["read", "web", "write", "run", "deploy"],
+      "max_parallel": 1,
+      "role_prompt": "你是 daily-news worker（每日早读报告）。规格全文见 super-agent/workers/daily-news/ROLE.md —— 开始前必须完整读它，以及它引用的 docs/daily-news-brief.md 与 docs/daily-news-brief.prompt.md（路径相对项目根目录）。要点：只把「前一天 08:00 → 今天 08:00」窗口内的要闻加工成 Markdown 文字版报告，**默认直接返回正文**（不生成 HTML、不发布博客、不生成插画；只有指派单明确要求发布时才走发布分支）。每个话题 ≥2 个一手来源，数字带出处，抓不到写「未证实」。把完整正文写进回执文件的「## 报告正文」段，并**自己按段发到飞书**（bot 身份，≤4500 字/条，带 i/N 标记）；router 只发确认与摘要，不转述正文。不编造模型名/分数/日期/star。不改 super-agent 框架文件。",
+      "accepts": ["早读", "早报", "每日新闻", "今日新闻", "生成早读报告", "news brief"],
+      "trigger_gate": {
+        "senders": ["ou_替换成你自己的_open_id"],
+        "require_p2p": true,
+        "comment": "早读只在 owner 本人的私聊里触发；群里、别人代问一律不派工（由 Task Center 校验 items[].requester）。"
+      }
+    }
+  ]
+}

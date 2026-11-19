@@ -1,0 +1,73 @@
+{
+  "_comment": "模板：复制为 lark_config.json 后按自己的飞书机器人填写。app_id / chat_id / open_id 均为本地标识符，不要提交。",
+  "enabled": true,
+  "mode": "pull",
+  "bot": {
+    "app_id": "cli_替换成你的_app_id",
+    "name": "你的飞书助手",
+    "open_id": "ou_替换成_bot_open_id"
+  },
+  "chats": [
+    {
+      "chat_id": "oc_替换成群_chat_id",
+      "name": "你的飞书助手群",
+      "mode": "group"
+    },
+    {
+      "chat_id": "oc_替换成私聊_chat_id",
+      "name": "你的飞书助手（私聊）",
+      "mode": "p2p"
+    }
+  ],
+  "senders": [
+    {
+      "open_id": "ou_替换成_owner_open_id",
+      "name": "你的名字"
+    }
+  ],
+  "trigger": {
+    "group_requires_mention": true,
+    "thread_requires_mention": true,
+    "mention_names": [
+      "你的飞书助手"
+    ],
+    "prefix_always_triggers": [
+      "!",
+      "派单",
+      "任务"
+    ],
+    "ignore_non_user_sender": true,
+    "min_length": 2
+  },
+  "poll": {
+    "interval_seconds": 20,
+    "page_size": 50,
+    "fallback_enabled": true,
+    "fallback_seconds": 120
+  },
+  "ack": {
+    "on_receive": false,
+    "text": "已收到，正在安排处理\n\n{title}\n\n（任务号由调度确认后给出）\n\n看板：http://127.0.0.1:8788"
+  },
+  "log_file": "logs/lark-bridge.log",
+  "bootstrap": {
+    "baseline_existing_on_first_run": true
+  },
+  "reply_in_thread": true,
+  "allow_any_sender": true,
+  "chat_discovery": {
+    "enabled": true,
+    "types": [
+      "group"
+    ],
+    "name_contains": [],
+    "exclude": []
+  },
+  "reactions": {
+    "enabled": true,
+    "received": "Typing",
+    "dispatched": "Status_PrivateMessage",
+    "completed": "DONE",
+    "suppress_ack_text": true
+  }
+}

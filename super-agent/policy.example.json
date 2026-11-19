@@ -1,0 +1,21 @@
+{
+  "_comment": "模板：复制为 policy.json 后按自己的人员与群填写。open_id 是本地标识符，不要提交。可用 SA_POLICY_FILE 指向别的路径。",
+  "owner": {
+    "open_id": "ou_替换成_owner_open_id",
+    "name": "你的名字"
+  },
+  "private_chat": {
+    "owner_only": true,
+    "comment": "私聊只有 owner 本人能发起命令"
+  },
+  "groups": {
+    "allow": [
+      "oc_替换成允许的群_chat_id"
+    ],
+    "comment": "只有这些群里，其他成员也可以发起命令；其余群一律不受理"
+  },
+  "people": {
+    "你的名字": "ou_替换成_owner_open_id"
+  },
+  "grant_ttl_hours": 48
+}

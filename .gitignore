@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# 操作系统 / 编辑器
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-workspace
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Node / 前端（看板 web/ 与 router_gate.ts 的依赖目录）
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-lock.yaml.bak
+.vite/
+.next/
+
+# ---------------------------------------------------------------------------
+# 运行期状态：super-agent 的"活的账本"，不入库
+#
+# 这些目录/文件记录真实任务、指派、飞书消息与回执正文，含同事姓名、open_id、
+# 群 id、内部工单号等敏感信息；且体积随运行时间线性增长。
+# 需要留痕请用 `sa.py` 导出，或另建脱敏归档目录。
+# ---------------------------------------------------------------------------
+super-agent/tasks/
+super-agent/channels/
+super-agent/outbox/
+super-agent/inbox/
+super-agent/logs/
+super-agent/router/
+super-agent/__pycache__/
+super-agent/.task-counter
+super-agent/lark_state.json
+super-agent/lark_state.lock
+super-agent/*.log
+
+# 根目录的个人工作日志（含会话 id、群 id、同事姓名）
+logs/
+
+# ---------------------------------------------------------------------------
+# 本地配置：含 app_id / open_id / 群 id 等标识符
+#
+# 入库的只有去掉标识符的 *.example.json 模板。
+# ---------------------------------------------------------------------------
+super-agent/lark_config.json
+super-agent/policy.json
+super-agent/registry.json
+
+# ---------------------------------------------------------------------------
+# 临时产物 / 抓取缓存
+# ---------------------------------------------------------------------------
+*.pid
+*.lock
+/tmp/
+feishu-file-*.txt
+feishu-file-*.pdf
+feishu-image-*.png
+feishu-image-*.jpg

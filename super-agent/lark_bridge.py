@@ -525,6 +525,8 @@ def send_text(chat_id: str, text: str, mentions: list | None = None) -> dict:
 # 完成的「结果」文字仍然发 —— 那是干活的产出，不是状态播报。
 DEFAULT_REACTIONS = {"received": "Typing", "dispatched": "Status_PrivateMessage",
                      "completed": "DONE"}
+# 所有贴表情的动作共用一把锁（表情是「替换」语义，并发会互相覆盖）
+_REACTION_LOCK = threading.Lock()
 
 
 def reaction_config() -> dict:
@@ -594,7 +596,33 @@ def react(message_id: str, emoji_type: str) -> bool:
 
     表情是锦上添花，不是链路成败的判据 —— 所以**失败只记日志不抛**，
     不能因为一个表情挂不上就把整条消息投递搞挂。
+
+    **加锁**：表情是「替换」语义，两次贴表情并发会互相覆盖
+    （旧的还没删、新的又加上）。所有贴表情的动作都串行执行。
     """
+    with _REACTION_LOCK:
+        return _react_locked(message_id, emoji_type)
+
+
+def react_async(message_id: str, emoji_type: str) -> None:
+    """异步贴表情 —— 不阻塞调用方。
+
+    用在「收到消息」这个节点：表情 API 一次要 ~1 秒，
+    不能因为贴表情把「投 router」拖后一秒（那一秒是用户的真实等待）。
+    """
+    if not message_id or not emoji_type:
+        return
+
+    def _run() -> None:
+        try:
+            react(message_id, emoji_type)
+        except Exception as e:
+            log(f"异步表情失败 {message_id}：{str(e)[:140]}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _react_locked(message_id: str, emoji_type: str) -> bool:
     if not message_id or not emoji_type:
         return False
     t0 = time.time()
@@ -968,16 +996,18 @@ def deliver_user_message(cfg: dict, chat: dict, msg: dict, body: str,
                 policy.mark_grant_used(gt, g.get("open_id") or "")
             except Exception:
                 pass
+    # ── 先贴「敲键盘」表情，再投 router ──
+    # 用户看到的第一反应应该是「收到了」，而不是等 router 跑完才看到结果。
+    # 异步贴：表情 API 一次要 ~1 秒，不能因为它把投 router 拖后。
+    rc = reaction_config()
+    if rc.get("enabled"):
+        react_async(msg_id, rc["received"])
     ev = sa.notify("user.message", None,
                    text=body.strip(),
                    source_ref=source_ref,
                    grant=grant_ctx or None,
                    source="feishu")
     log(f"飞书消息已投递 router（待判断新建/沿用）：{body[:60]}")
-    # 收到任务 → 在用户那条消息上挂 👌，不用等 router 想清楚
-    rc = reaction_config()
-    if rc.get("enabled"):
-        react(msg_id, rc["received"])
     return ev
 
 

@@ -1017,7 +1017,7 @@ def main() -> None:
               "def delete_reaction" in src7 and "delete_reaction(message_id" in src7)
         check("完成是终态不降级", '"DONE"' in src7 and "不再降级" in src7)
         check("有表情 API 调用", "reactions" in src7 and "reaction_type" in src7)
-        check("收到任务在消息投递时就挂表情", "react(msg_id, rc[\"received\"])" in src7)
+        check("收到任务在消息投递时就挂表情", "react_async(msg_id, rc[\"received\"])" in src7)
         check("有按指派状态补表情的扫描", "def sync_reactions" in src7)
         check("受理回执 ack 被拦成 suppressed", "suppress_ack_text" in src7 and "suppressed" in src7)
         check("ack 文字不再发", "ack.on_receive" in src7 or 'ack.get("on_receive"' in src7)
@@ -1340,6 +1340,19 @@ def main() -> None:
         check("等级取值合法", (mst5 := _mst5.get("thinking")) in rt5.THINKING_LEVELS, str(mst5))
         _srv5 = (pathlib.Path(__file__).resolve().parent / "serve.py").read_text(encoding="utf-8")
         check("看板接口也能改等级", '"thinking"' in _srv5 and "THINKING_LEVELS" in _srv5)
+
+        print("\n[26g-6] 表情先于投 router（收到就贴，不等 router 结果）")
+        _src6 = (pathlib.Path(__file__).resolve().parent / "lark_bridge.py").read_text(encoding="utf-8")
+        _du = _src6[_src6.index("def deliver_user_message"):_src6.index("# ------------------------------------------------------------------ 拉取")]
+        _i_react = _du.index('react_async(msg_id, rc["received"])')
+        _i_notify = _du.index('sa.notify("user.message"')
+        check("贴表情在投 router 之前", _i_react < _i_notify, f"react@{_i_react} notify@{_i_notify}")
+        check("贴表情是异步的（不把投 router 拖后 ~1 秒）",
+              "def react_async" in _src6 and "threading.Thread(target=_run" in _src6)
+        check("贴表情全程加锁（替换语义，并发会互相覆盖）",
+              "_REACTION_LOCK = threading.Lock()" in _src6 and "with _REACTION_LOCK:" in _src6)
+        import lark_bridge as lb6
+        check("有异步贴表情入口", callable(getattr(lb6, "react_async", None)))
 
         print("\n[26h] 事件带说话人/渠道/话题 + 链式派工上限 + worker prompt 内联")
         import router as rt4

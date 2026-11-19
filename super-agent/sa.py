@@ -1066,6 +1066,8 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
             # 结果类消息挂上批次 → 桥接把同批的结果**合并成一条**再发，
             # 不再一条指派一条群消息。受理回执/提问/派单回话不挂批次（要立刻发）。
             batch=(round_batch if (ob.get("purpose") or "") == "result" else ""),
+            # 结构化 @ 提及（飞书的 @ 是消息内容里的实体，不是正文里的「@名字」）
+            mentions=(ob.get("mentions") or []),
             actor=actor)
         result["applied"].append({"kind": "outbox", "id": rec["id"],
                                    "purpose": rec["purpose"],

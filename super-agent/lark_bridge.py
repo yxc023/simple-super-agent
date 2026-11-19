@@ -422,23 +422,92 @@ def reply_in_thread() -> bool:
         return True
 
 
-def send_reply(message_id: str, text: str, in_thread: bool | None = None) -> dict:
+# ── @ 提及：飞书里的 @ 不是文本里的「@名字」 ─────────────────────────
+# 飞书的 @ 是**消息内容里的提及实体**：
+#   · text 消息：<at user_id="ou_xxx">名字</at>
+#   · post 消息：{"tag":"at","user_id":"ou_xxx"}
+# 写成「@名字」只是普通文字 —— 对方**收不到通知**、不高亮、点不开。
+# 卡片语法 <at id="ou_xxx"></at> 用在文字消息里也**不生效**（原样当文本）。
+#
+# 桥接接受三种写法，都会变成真正的提及：
+#   1. outbox 记录的 mentions 字段（结构化，Decision 里给）：
+#      [{"open_id": "ou_xxx", "name": "显示名", "at": "start"|"end"}]
+#   2. 行内占位符（要放在正文中间时）：@[ou_xxx] 或 @[ou_xxx|显示名]
+#   3. 已经写对的 <at user_id="ou_xxx">名字</at> → 原样保留
+# 顺带把卡片写法 <at id="ou_xxx"></at> 修正成文字写法。
+_AT_PLACEHOLDER_RE = re.compile(r"@\[(ou_[0-9A-Za-z]+)(?:\|([^\]\n]{1,64}))?\]")
+_AT_CARD_RE = re.compile(r"<at\s+id=\"?(ou_[0-9A-Za-z]+|all)\"?\s*>([^<]*)</at>",
+                         re.IGNORECASE)
+
+
+def _mention_name(open_id: str, fallback: str = "") -> str:
+    """提及里显示的名字：优先给定的，其次人员目录反查。"""
+    if fallback:
+        return fallback
+    try:
+        import policy
+        return policy.person_name(open_id) or ""
+    except Exception:
+        return ""
+
+
+def render_mentions(text: str, mentions: list | None = None) -> str:
+    """把正文里的 @ 写法换成飞书真正的提及实体。
+
+    返回可直接作为 text 消息 content 的正文。
+    """
+    text = text or ""
+    # ① 卡片写法 → 文字写法（卡片语法在文字消息里不生效）
+    text = _AT_CARD_RE.sub(
+        lambda mo: f'<at user_id="{mo.group(1)}">{mo.group(2) or ""}</at>', text)
+    # ② 行内占位符 → 提及实体
+    def _ph(mo: "re.Match[str]") -> str:
+        oid = mo.group(1)
+        name = _mention_name(oid, (mo.group(2) or "").strip())
+        return f'<at user_id="{oid}">{name}</at>'
+    text = _AT_PLACEHOLDER_RE.sub(_ph, text)
+    # ③ 结构化 mentions 字段 → 追加/前置提及
+    for m in (mentions or []):
+        if isinstance(m, str):
+            m = {"open_id": m}
+        if not isinstance(m, dict):
+            continue
+        oid = (m.get("open_id") or m.get("id") or "").strip()
+        if not oid:
+            continue
+        if f'user_id="{oid}"' in text:
+            continue                      # 正文里已经提过他了
+        name = _mention_name(oid, (m.get("name") or "").strip())
+        tag = f'<at user_id="{oid}">{name}</at>'
+        if str(m.get("at") or "start").lower() == "end":
+            text = text.rstrip() + " " + tag
+        else:
+            text = tag + " " + text.lstrip()
+    return text
+
+
+def send_reply(message_id: str, text: str, in_thread: bool | None = None,
+               mentions: list | None = None) -> dict:
     """回复一条消息，返回渠道响应（用于记录投递凭据）。
 
     默认走**飞书话题**（--reply-in-thread）：回复出现在原消息的话题串里，
     而不是混在群聊主频道。群消息是多人共享的，话题串能让「这条消息 → 一串回复」
     归到一起，不刷屏。
+
+    mentions：结构化 @ 提及（open_id 列表）；正文里的 @[ou_xxx] 占位符也会被转换。
     """
     if in_thread is None:
         in_thread = reply_in_thread()
-    cmd = ["im", "+messages-reply", "--as", "bot", "--message-id", message_id, "--text", text]
+    cmd = ["im", "+messages-reply", "--as", "bot", "--message-id", message_id,
+           "--text", render_mentions(text, mentions)]
     if in_thread:
         cmd.append("--reply-in-thread")
     return lark(cmd)
 
 
-def send_text(chat_id: str, text: str) -> dict:
-    return lark(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id, "--text", text])
+def send_text(chat_id: str, text: str, mentions: list | None = None) -> dict:
+    return lark(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
+                 "--text", render_mentions(text, mentions)])
 
 
 # ------------------------------------------------------------------ 表情
@@ -1391,10 +1460,17 @@ def _deliver_batch(batch_id: str, recs: list[dict]) -> int:
         for r in recs:
             core.update_outbox(r, status="cancelled", note="批次合并时正文为空")
         return 0
-    return _deliver_one(recs[0], text=text, siblings=recs[1:])
+    # 合并后的提及也要合起来（否则只提第一个人）
+    mentions = []
+    for r in recs:
+        for m in (r.get("mentions") or []):
+            if m not in mentions:
+                mentions.append(m)
+    return _deliver_one(recs[0], text=text, siblings=recs[1:], mentions=mentions)
 
 
-def _deliver_one(rec: dict, text: str = "", siblings: list | None = None) -> int:
+def _deliver_one(rec: dict, text: str = "", siblings: list | None = None,
+                 mentions: list | None = None) -> int:
     """投递一条 outbox 记录。
 
     siblings 非空时：正文用 text（合并后的），投递成功后**所有**记录一起标成功
@@ -1434,8 +1510,9 @@ def _deliver_one(rec: dict, text: str = "", siblings: list | None = None) -> int
             log(f"outbox {rec['id']} 是受理回执 → 改用表情，不发文字")
             return 1
         body = text or (rec.get("text") or "")
+        mentions = mentions if mentions is not None else (rec.get("mentions") or [])
         via = "reply" if mid else "send"
-        resp = send_reply(mid, body) if mid else send_text(chat, body)
+        resp = send_reply(mid, body, mentions=mentions) if mid else send_text(chat, body, mentions=mentions)
         # ── 真渠道校验：桩 / 被替换的客户端一律不算投递成功 ──
         if not isinstance(resp, dict):
             raise RuntimeError(

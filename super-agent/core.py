@@ -417,7 +417,8 @@ def resolve_session(task_id: str = "", chat_id: str = "", message_id: str = "",
 def add_outbox(*, target: str, purpose: str, text: str, task: str = "",
                assignment: str = "", channel: str = "", chat_id: str = "",
                message_id: str = "", sender: str = "", actor: str = "",
-               batch: str = "", dedupe_window_seconds: int = 900) -> dict:
+               batch: str = "", mentions: list | None = None,
+               dedupe_window_seconds: int = 900) -> dict:
     """写入一条待发消息。
 
     同一条消息被重复提交（例如 Decision 重投）时不产生第二条 —— 按
@@ -452,6 +453,8 @@ def add_outbox(*, target: str, purpose: str, text: str, task: str = "",
         "assignment": assignment,
         # 批次 id：同一批的结果消息在投递时合并成一条（见 bridge 的 deliver_outbox）
         "batch": batch or "",
+        # 结构化 @ 提及：[{"open_id": "ou_xxx", "name": "显示名", "at": "start|end"}]
+        "mentions": list(mentions or []),
         "channel": channel or "feishu",
         "chat_id": sess["chat_id"],
         "reply_to": sess["reply_to"],

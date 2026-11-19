@@ -686,13 +686,13 @@ def main() -> None:
         orig_lb_log = lb.LOG_FILE
         lb.LOG_FILE = tmp / "bridge_cred.log"
         orig_send_reply = lb.send_reply
-        lb.send_reply = lambda mid, text, in_thread=None: None      # 桩：只 append，不返回
+        lb.send_reply = lambda mid, text, in_thread=None, **kw: None  # 桩：只 append，不返回
         lb.deliver_outbox()
         rec_c = [r for r in core.list_outbox() if r["id"] == rec_c["id"]][0]
         check("桩返回 None → 不写 succeeded", rec_c["status"] != "succeeded", rec_c["status"])
         check("桩返回 None → 记了失败原因", bool(rec_c.get("last_error")),
               str(rec_c.get("last_error"))[:120])
-        lb.send_reply = lambda mid, text, in_thread=None: {
+        lb.send_reply = lambda mid, text, in_thread=None, **kw: {
             "ok": True, "data": {"message_id": "om_new_receipt"}}
         core.update_outbox(rec_c, status="pending", attempts=0, last_error="")
         lb.deliver_outbox()
@@ -713,7 +713,7 @@ def main() -> None:
                                   task="", chat_id="oc_" + "c" * 32,
                                   message_id="om_ack_me", dedupe_window_seconds=0)
         sent_calls = []
-        lb.send_reply = lambda mid, text, in_thread=None: sent_calls.append(text) or {
+        lb.send_reply = lambda mid, text, in_thread=None, **kw: sent_calls.append(text) or {
             "ok": True, "data": {"message_id": "om_should_not_happen"}}
         lb.deliver_outbox()
         lb.send_reply = orig_send_reply
@@ -1192,8 +1192,8 @@ def main() -> None:
         core.OUTBOX_DIR = tmp / "outbox_batch"
         _sent = []
         _orig_send = lb3.send_reply
-        lb3.send_reply = lambda mid, text: (_sent.append((mid, text)),
-                                            {"ok": True, "message_id": "om_x"})[1]
+        lb3.send_reply = lambda mid, text, **kw: (_sent.append((mid, text)),
+                                                  {"ok": True, "message_id": "om_x"})[1]
         try:
             r1 = core.add_outbox(target="thread", purpose="result", text="T876 已完成",
                                  task="T910", assignment="A01", batch="om_batch_1",
@@ -1273,6 +1273,55 @@ def main() -> None:
         check("契约要求后续指派带具体标识", "### 后续指派要带具体标识" in _rs)
         check("SKILL.md 由契约生成（单一真源）",
               "### 先派单，后叙述" in (pathlib.Path(__file__).resolve().parent / "skill" / "SKILL.md").read_text(encoding="utf-8"))
+
+        print("\n[26g-4] @ 提及：飞书的 @ 是消息内容里的实体，不是正文里的「@名字」")
+        import lark_bridge as lb4
+        _OID = "ou_b18ba1fe9a09cabbe57e9af34535cec7"
+        _rm = lb4.render_mentions(f"你好 @[{_OID}]")
+        check("行内占位符 → 真正的提及实体",
+              _rm.startswith("你好 <at user_id=") and _rm.endswith("</at>"),
+              _rm)
+        _rm2 = lb4.render_mentions(f"@[{_OID}|小德老师]")
+        check("占位符可带显示名",
+              "小德老师</at>" in _rm2 and f'user_id="{_OID}"' in _rm2, _rm2)
+        check("卡片写法 <at id=…> 被修正成文字写法",
+              lb4.render_mentions(f'<at id="{_OID}"></at>') ==
+              f'<at user_id="{_OID}"></at>',
+              lb4.render_mentions(f'<at id="{_OID}"></at>'))
+        check("结构化 mentions 放正文开头",
+              lb4.render_mentions("这条需要你拍板。", [{"open_id": _OID}]).startswith(
+                  f'<at user_id="{_OID}">'),
+              lb4.render_mentions("这条需要你拍板。", [{"open_id": _OID}]))
+        check("结构化 mentions 可放结尾",
+              lb4.render_mentions("这条需要你拍板。",
+                                  [{"open_id": _OID, "at": "end"}]).rstrip().endswith("</at>"))
+        check("正文里已提过的人不重复提",
+              lb4.render_mentions(f"已提 @[{_OID}]", [{"open_id": _OID}]).count("user_id=") == 1,
+              lb4.render_mentions(f"已提 @[{_OID}]", [{"open_id": _OID}]))
+        check("纯文本 @名字 不被当成提及（不乱 @ 人）",
+              "@小德" in lb4.render_mentions("@小德 看一下") and
+              "<at" not in lb4.render_mentions("@小德 看一下"))
+        # outbox 记录能带 mentions（Decision → outbox）
+        _orig_dir4 = core.OUTBOX_DIR
+        core.OUTBOX_DIR = tmp / "outbox_mentions"
+        try:
+            _rec_m = core.add_outbox(target="thread", purpose="question", text="需要你拍板",
+                                     task="", chat_id="oc_" + "c" * 32,
+                                     message_id="om_m1", mentions=[{"open_id": _OID}],
+                                     dedupe_window_seconds=0)
+            check("outbox 记录带上了 mentions",
+                  _rec_m.get("mentions") and _rec_m["mentions"][0]["open_id"] == _OID,
+                  str(_rec_m.get("mentions")))
+        finally:
+            core.OUTBOX_DIR = _orig_dir4
+        # 契约：说清用 mentions 参数，不是文本 @
+        _rs4 = (pathlib.Path(__file__).resolve().parent / "skill" / "router-system.md").read_text(encoding="utf-8")
+        check("契约里有 @ 提及的说明", "### @ 某人：用 `mentions` 参数" in _rs4)
+        check("契约说明了文字消息的提及写法", '<at user_id="ou_xxx">' in _rs4)
+        check("契约警告了卡片写法在文字消息里不生效", "卡片写法" in _rs4 or "只**在卡片里生效" in _rs4)
+        check("SKILL.md 同步了 @ 提及说明",
+              "### @ 某人：用 `mentions` 参数" in
+              (pathlib.Path(__file__).resolve().parent / "skill" / "SKILL.md").read_text(encoding="utf-8"))
 
         print("\n[26h] 事件带说话人/渠道/话题 + 链式派工上限 + worker prompt 内联")
         import router as rt4

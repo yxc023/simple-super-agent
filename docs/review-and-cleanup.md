@@ -139,3 +139,50 @@ python3 super-agent/selftest.py        # 279 / 279 通过（新增 [26g-3] 21 �
 - **router 侧的「等齐」靠模型自觉**：代码只保证「结果消息会合并」，
   模型若仍提前发一条中间结果，用户会收到两条（一条合并后的 + 一条提前的）。
   契约里已写明「还有在跑的只放行不回话」，但这是**提示词约束**，不是硬闸门。
+
+---
+
+# 第三轮：@ 提及要发成「消息内容里的提及实体」（2026-11-19）
+
+## 一、问题
+
+飞书的 @ **不是正文里的一个「@名字」** —— 它是**消息内容里的提及实体**：
+
+| 消息类型 | 提及写法 |
+| --- | --- |
+| 文字消息（桥接用的） | `<at user_id="ou_xxx">名字</at>` |
+| 富文本 post | `{"tag":"at","user_id":"ou_xxx"}` |
+| 卡片 | `<at id=ou_xxx></at>`（**只**在卡片里生效） |
+
+原状（两个都错）：
+
+1. router 在正文里写「@杨晓辰(小德)」→ **只是普通文字**，对方收不到通知、不高亮、点不开；
+2. `ke-bpm-approver` skill 让 worker 产出 `<at id=ou_xxx></at>` → 那是**卡片语法**，
+   放进文字消息里**不生效**（`lark-cli --dry-run` 实测：原样进 content）。
+
+所以凡是「需要人拍板」的回报（`purpose=question`），实际**根本没 @ 到人**。
+
+## 二、改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `lark_bridge.render_mentions()` | 新增：把三种写法转成真正的提及实体 —— ① outbox 记录的 `mentions` 结构化字段；② 行内占位符 `@[ou_xxx]` / `@[ou_xxx\|名字]`；③ 已写对的 `<at user_id=…>` 原样保留；并把卡片写法 `<at id=…>` **修正**成文字写法 |
+| `lark_bridge.send_reply/send_text` | 发送前统一过 `render_mentions()`；批次合并时各条记录的 mentions 也会合并 |
+| `core.add_outbox` / `sa.apply_decision` | outbox 记录新增 `mentions` 字段，Decision 的 outbox 条目可直接给 `mentions` |
+| `skill/router-system.md`（真源） | 新增「@ 某人：用 `mentions` 参数」一节：说清三种消息类型的写法差异、结构化参数与行内占位符、**别在正文里只写名字** |
+| `ke-bpm-approver` SKILL.md（仓外） | v0.7.1 → **v0.7.2**：回报规范的 @ 写法从卡片语法 `<at id=…>` 改成文字语法 `<at user_id="ou_xxx">名字</at>`，并注明「不要用卡片写法」 |
+
+**刻意不做**：把正文里的「@名字」自动升级成提及 —— 报告里经常提到第三方姓名，
+自动升级会误 @ 到不该被通知的人。纯文本 `@名字` 保持原样。
+
+## 三、验证
+
+- `selftest.py` **291 / 291**（新增 `[26g-4]` 12 条断言：占位符转换、卡片写法修正、
+  结构化 mentions 的 start/end、正文已提过不重复、纯文本 @名字 不被升级、
+  outbox 带 mentions、契约三条）。
+- **线上实测**：用桥接的真实发送路径发了一条带 `mentions` 的私聊消息，读回来是
+  ```json
+  "mentions": [{"id": "ou_b18ba1fe9a09cabbe57e9af34535cec7",
+                "key": "@_user_1", "name": "杨晓辰(小德)"}]
+  ```
+  → 飞书认成了真提及（`key=@_user_1` 是飞书内部的提及占位键），对方会收到 @ 通知。

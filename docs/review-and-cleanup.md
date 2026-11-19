@@ -389,3 +389,58 @@ router 的职责是「语义判断 + 写 Decision」，不是长链推理任务 
 - 表情循环**等长连接就绪再发**：否则一启动就把状态标成「已发」，
   连接上来之后这些表情就再也不会发了（第一版就踩了这个）。
 - `selftest` **322 / 322**（新增 `[26i]` 5 条表情相关断言）。
+
+## 补充：企微 CLI / 官方文档侧的交叉验证（2026-11-19 晚）
+
+结论仍然是「企微没有贴表情回应的 API」，这次把**三条路**都查了：
+
+### 1. 官方 CLI（本机 `wecom-cli` v0.1.9，已扫码绑定）
+
+CLI 的能力目录是**服务端动态下发**的（`wecom-cli schema list` / `<service> --help`）。
+本机实测：
+
+| 品类 | 状态 |
+| --- | --- |
+| `doc`（文档/智能表格） | ✅ 可用 |
+| `todo`（待办） | ✅ 可用 |
+| `msg` / `contact` / `meeting` / `schedule` | ❌ 「当前企业暂不支持授权机器人「消息」使用权限」 |
+
+官方仓库 `WeComTeam/wecom-cli` 的 **`skills/wecomcli-message/SKILL.md`**
+是「消息」品类的完整能力说明（即使本机没权限，也能从文档读到）：
+
+- `wecom-cli message aibot sessions list` —— 查机器人最近会话
+- `wecom-cli message aibot send` —— `msg_type` ∈ **markdown / image / file / voice / video**
+- 文档里明写：「**普通文本也按 Markdown 发送**」
+
+→ 没有 reaction、没有 emoji、没有「表情回应」。全仓 grep `reaction|表情|emoji` = **0 命中**。
+
+### 2. 官方 AI Open Capabilities 页
+
+> Message Open Capabilities
+> - Query the robot's recent conversations
+> - Send a message to the conversation where the robot resides
+
+### 3. 智能机器人更新日志
+
+2026/03/13「长连接智能机器人支持推送图片、语音、视频、文件和消息卡片格式消息」
+—— 消息类型扩展过，**始终没有表情**。
+
+### 4. 长连接协议穷举探测
+
+7 个候选命令名（`aibot_respond_reaction` / `aibot_reaction` / `aibot_respond_emoji` /
+`aibot_msg_reaction` / `aibot_respond_msg_reaction` / `aibot_emoji` / `aibot_respond_sticker`）
+→ **服务端一个都没识别**（无任何应答帧；被识别的命令即使参数不对也会回 40008）。
+
+### 方向别搞混
+
+企微客户端里**用户**可以对机器人的消息做表情回应 —— 那是 `feedback_event`，
+方向是**用户 → 机器人**。机器人 → 用户这一侧没有对应接口。
+
+### 顺带挖到的三件事（可用）
+
+1. `message aibot sessions list` 能给出 **chat_id / chat_name / chat_type**（含群名）——
+   现在企微侧 `chat_name` 是空的，router 只能显示「企业微信（single）」；
+   等企业开通「消息」权限就能把群名补上。
+2. 更新日志 2026/06/23：「支持第三方应用与企业智能机器人 **open_userid 的转换**」——
+   可把加密 userid 换成明文，router 里就不用显示 `wok9U4DAAA…` 这种串。
+3. 本企业当前只给机器人开通了「文档」「待办」两个品类。

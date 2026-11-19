@@ -75,12 +75,14 @@ def pid_alive(pid_file: pathlib.Path) -> dict:
     return info
 
 
-BOARD_PID_DEFAULT = pathlib.Path("/tmp/super-agent-board.pid")
 
 
 def board_pid_file(port: int) -> pathlib.Path:
-    """pid 文件按端口分 —— 不同端口的看板不该抢同一个 pid 文件。"""
-    return BOARD_PID_DEFAULT if port == 8788 else pathlib.Path(f"/tmp/super-agent-board-{port}.pid")
+    """pid 文件按端口分 —— 不同端口的看板不该抢同一个 pid 文件。
+
+    命名与 board.sh 保持一致：super-agent-board-<port>.pid。
+    """
+    return pathlib.Path(f"/tmp/super-agent-board-{port}.pid")
 
 
 def collect_daemons(port: int = 8788) -> dict:

@@ -999,7 +999,7 @@ def main() -> None:
         check("侧栏 sticky，滚动时任务列表常驻", "position:sticky" in web)
         check("自动刷新不再重置筛选", "S.filter='all'" not in web)
         srv2 = (pathlib.Path(__file__).resolve().parent / "serve.py").read_text(encoding="utf-8")
-        check("看板自登记 pid（不再显示「已停止」）", "super-agent-board.pid" in srv2)
+        check("看板自登记 pid（不再显示「已停止」）", "super-agent-board-" in srv2)
         check("待处理数按 processed.json 算（不再是假数）",
               "processed.json" in srv2 and "pfile" in srv2)
         check("长列表有上限，不再全量渲染", "MSG_CAP" in web and "OB_CAP" in web and "DEC_CAP" in web)

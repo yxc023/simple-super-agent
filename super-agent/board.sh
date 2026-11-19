@@ -45,27 +45,36 @@ case "$ACTION" in
     rm -f "$PID_FILE"
     ;;
   status)
-    if is_running; then echo "运行中 (pid $(cat "$PID_FILE"))  http://127.0.0.1:$PORT"
+    if is_running; then echo "运行中 (pid $(cat "$PID_FILE"))  http://127.0.0.1:${PORT}"
     else echo "未在运行"; fi
     ;;
   start)
     if is_running; then
-      echo "已在运行 (pid $(cat "$PID_FILE"))  http://127.0.0.1:$PORT"
+      echo "已在运行 (pid $(cat "$PID_FILE"))  http://127.0.0.1:${PORT}"
       exit 0
     fi
     if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-      echo "端口 $PORT 已被占用，先停掉那个进程，或换个端口：./super-agent/board.sh 9000" >&2
+      echo "端口 ${PORT} 已被占用，先停掉那个进程，或换个端口：./super-agent/board.sh 9000" >&2
       exit 1
     fi
 
-    echo "启动看板：http://127.0.0.1:$PORT"
-    ( cd "$DIR" && nohup python3 serve.py --port "$PORT" >"$LOG_FILE" 2>&1 & echo $! > "$PID_FILE" )
+    echo "启动看板：http://127.0.0.1:${PORT}"
+    # 用 python 的 start_new_session=True 启动：**独立进程组**。
+    # 之前用 nohup ... & 时，父 shell 一退出（或被中断），看板就跟着没了。
+    BOARD_DIR="$DIR" BOARD_PORT="$PORT" BOARD_LOG="$LOG_FILE" python3 -c '
+import os, subprocess, sys
+log = open(os.environ["BOARD_LOG"], "ab")
+p = subprocess.Popen([sys.executable, "serve.py", "--port", os.environ["BOARD_PORT"]],
+                     stdout=log, stderr=subprocess.STDOUT,
+                     cwd=os.environ["BOARD_DIR"], start_new_session=True)
+open("/tmp/super-agent-board-%s.pid" % os.environ["BOARD_PORT"], "w").write(str(p.pid))
+'
 
     # 冷启动可能慢一点，等 15 秒
     for _ in $(seq 1 75); do
       if curl -sf "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
         (command -v open >/dev/null && open "http://127.0.0.1:$PORT") || true
-        echo "就绪（日志：$LOG_FILE）"
+        echo "就绪（日志：${LOG_FILE}）"
         exit 0
       fi
       sleep 0.2

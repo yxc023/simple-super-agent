@@ -643,17 +643,24 @@ def verify_user_event(ev: dict, ledger_wait_seconds: float = 0.0) -> tuple[bool,
     """
     if (ev.get("kind") or "") != "user.message":
         return True, ""
-    if (ev.get("source") or "") != "feishu":
+    source = (ev.get("source") or "")
+    if source not in ("feishu", "wecom"):
         return True, ""
     ref = ev.get("source_ref") or {}
     if not isinstance(ref, dict):
         return False, "source_ref 不是对象"
     chat_id = str(ref.get("chat_id") or "")
     msg_id = str(ref.get("message_id") or "")
-    if not CHAT_ID_RE.match(chat_id):
-        return False, "chat_id 形态非法（期望 oc_+32 位十六进制）"
-    if not msg_id.startswith(MESSAGE_ID_PREFIX):
-        return False, "message_id 不以 om_ 开头"
+    if source == "feishu":
+        if not CHAT_ID_RE.match(chat_id):
+            return False, "chat_id 形态非法（期望 oc_+32 位十六进制）"
+        if not msg_id.startswith(MESSAGE_ID_PREFIX):
+            return False, "message_id 不以 om_ 开头"
+    else:
+        # 企微：会话 id 形态不固定（群 chatid / 单聊 userid），
+        # 但 message_id 必须在账本里 —— 同样是「桥接产出」才可信。
+        if not msg_id:
+            return False, "message_id 为空"
     if msg_id in ledger_ids():
         return True, ""
     deadline = time.time() + max(0.0, ledger_wait_seconds)

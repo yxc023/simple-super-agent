@@ -1,0 +1,19 @@
+{
+  "bot": {
+    "bot_id": "aib0XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "secret": "请填长连接 Secret（不是 Token/EncodingAESKey）",
+    "name": "@机器人在群里的显示名"
+  },
+  "senders": [
+    {"userid": "企微成员 userid", "name": "显示名"}
+  ],
+  "allow_any_sender": false,
+  "trigger": {
+    "group_requires_mention": true,
+    "min_length": 2
+  },
+  "welcome": "您好，我是智能助手，有什么可以帮您？",
+  "wss": {
+    "endpoint": "wss://openws.work.weixin.qq.com"
+  }
+}

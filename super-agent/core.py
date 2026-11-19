@@ -386,19 +386,25 @@ def task_source_ref(task_id: str) -> dict:
 
 
 def resolve_session(task_id: str = "", chat_id: str = "", message_id: str = "",
-                    thread_id: str = "", root_id: str = "") -> dict:
+                    thread_id: str = "", root_id: str = "",
+                    reply_to: str = "") -> dict:
     """解析一条外发消息的投递会话。
 
     调用方给了会话就直接用；没给就**从任务的 source_ref 继承** ——
     Decision 生成的 ack 若丢了会话标识，投递器会判成「无处可投」并静默丢弃，
     用户永远收不到「已受理：任务号 TXXX」。
 
+    `reply_to` 是「回复到哪条消息」的标识，**各渠道不一样**：
+      · 飞书：被回复消息的 message_id（om_…）
+      · 企微：回调帧的 req_id（回复消息必须透传它）
+    所以它既可以由调用方显式给，也可以从 source_ref 继承（键名 reply_to）。
+
     返回 {"chat_id", "reply_to", "sender", "thread_id", "root_id", "session_source"}。
     """
     ref = task_source_ref(task_id)
     got_chat = chat_id or ref.get("chat_id", "")
-    got_reply = message_id or ref.get("message_id", "")
-    if chat_id or message_id:
+    got_reply = reply_to or message_id or ref.get("reply_to", "") or ref.get("message_id", "")
+    if chat_id or message_id or reply_to:
         source = "explicit"
     elif got_chat or got_reply:
         source = "task.source_ref"
@@ -444,6 +450,9 @@ def add_outbox(*, target: str, purpose: str, text: str, task: str = "",
     mid = f"ob_{uuid.uuid4().hex[:10]}"
     # 会话标识：调用方没给就从任务来源继承（Decision 生成的 ack 最容易缺这一段）
     sess = resolve_session(task, chat_id, message_id)
+    # 渠道：没显式给就从任务来源继承 —— 企微来的任务不能被飞书投递器取走
+    if not channel:
+        channel = task_source_ref(task).get("platform", "") or "feishu"
     rec = {
         "id": mid,
         "target": target,

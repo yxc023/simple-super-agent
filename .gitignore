@@ -56,6 +56,8 @@ super-agent/__pycache__/
 super-agent/.task-counter
 super-agent/lark_state.json
 super-agent/lark_state.lock
+super-agent/wecom_state.json
+super-agent/wecom_state.lock
 super-agent/*.log
 
 # 根目录的个人工作日志（含会话 id、群 id、同事姓名）
@@ -67,6 +69,7 @@ logs/
 # 入库的只有去掉标识符的 *.example.json 模板。
 # ---------------------------------------------------------------------------
 super-agent/lark_config.json
+super-agent/wecom_config.json
 super-agent/policy.json
 super-agent/registry.json
 

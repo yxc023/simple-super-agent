@@ -1354,6 +1354,69 @@ def main() -> None:
         import lark_bridge as lb6
         check("有异步贴表情入口", callable(getattr(lb6, "react_async", None)))
 
+        print("\n[26i] 企微智能机器人接入（长连接 + 按渠道分流）")
+        _root_i = pathlib.Path(__file__).resolve().parent
+        _wb_i = (_root_i / "wecom_bridge.py")
+        check("有企微桥接脚本", _wb_i.exists())
+        _src_i = _wb_i.read_text(encoding="utf-8") if _wb_i.exists() else ""
+        check("走长连接端点（不需要公网地址）",
+              "wss://openws.work.weixin.qq.com" in _src_i and "aibot_subscribe" in _src_i)
+        check("回复透传回调的 req_id",
+              "aibot_respond_msg" in _src_i and "aibot_send_msg" in _src_i)
+        check("有心跳与重连", "PING_INTERVAL" in _src_i and "RECONNECT_BACKOFF" in _src_i)
+        check("企微投递器只取 channel=wecom 的",
+              '(r.get("channel") or "") == "wecom"' in _src_i)
+        _lb_i = (_root_i / "lark_bridge.py").read_text(encoding="utf-8")
+        check("飞书投递器只取 channel=feishu 的",
+              '(r.get("channel") or "feishu") == "feishu"' in _lb_i)
+        check("飞书投递器遇到别的渠道是「跳过」不是「作废」",
+              'return 0' in _lb_i.split('if rec.get("channel") != "feishu":')[1][:400]
+              and 'status="cancelled"' not in _lb_i.split('if rec.get("channel") != "feishu":')[1][:400])
+        check("企微配置不入库（只提交 example）",
+              (_root_i / "wecom_config.example.json").exists()
+              and "wecom_config.json" in
+              (_root_i.parent / ".gitignore").read_text(encoding="utf-8"))
+        _ex_i = json.loads((_root_i / "wecom_config.example.json").read_text(encoding="utf-8"))
+        _real_i = json.loads((_root_i / "wecom_config.json").read_text(encoding="utf-8"))
+        check("example 里没有真实凭据",
+              "aib0HXOC9RXpwoBryQATEZnGgqgV9QH9qBD" not in json.dumps(_ex_i, ensure_ascii=False))
+        check("真实凭据只在本机配置里",
+              _real_i["bot"]["bot_id"] != _ex_i["bot"]["bot_id"])
+        # 渠道继承：任务来源是企微 → outbox 落 wecom（**在沙箱里跑**，不碰生产任务）
+        import os as _os_i
+        import subprocess as _sp_i
+        _probe_i = (
+            "import json, sa, core\n"
+            "t = sa.create_task_internal(title='渠道继承探针', goal='g', acceptance='a',\n"
+            "    source='wecom', source_ref=['platform=wecom', 'chat_id=wr_x',\n"
+            "                              'message_id=wm_x', 'reply_to=req_x'])\n"
+            "tid = t if isinstance(t, str) else t['id']\n"
+            "rec = core.add_outbox(target='thread', purpose='reply', text='t', task=tid)\n"
+            "print(json.dumps({'channel': rec['channel'], 'reply_to': rec['reply_to'],\n"
+            "                  'chat_id': rec['chat_id']}))\n"
+        )
+        _env_i = {k: v for k, v in _os_i.environ.items()
+                  if not k.startswith("SA_") and k not in ("SA_ROOT",)}
+        _env_i["SA_ROOT"] = str(tmp / "wecom_sandbox")
+        _proc_i = _sp_i.run([sys.executable, "-c", _probe_i], cwd=str(_root_i),
+                             env=_env_i, capture_output=True, text=True)
+        _out_i = {}
+        try:
+            _out_i = json.loads((_proc_i.stdout or "{}").strip().splitlines()[-1])
+        except Exception:
+            _out_i = {}
+        check("outbox 渠道从任务来源继承（企微→wecom）",
+              _out_i.get("channel") == "wecom", str(_out_i))
+        check("outbox 回复目标继承 req_id（企微回复要透传它）",
+              _out_i.get("reply_to") == "req_x", str(_out_i))
+        check("outbox 会话从任务来源继承", _out_i.get("chat_id") == "wr_x", str(_out_i))
+        import router as _rt_i
+        _ev_w = {"kind": "user.message", "source": "wecom",
+                 "source_ref": {"platform": "wecom", "chat_id": "wr_x",
+                                "message_id": "wm_not_in_ledger"}}
+        _ok_w, _why_w = _rt_i.verify_user_event(_ev_w)
+        check("企微事件也要过账本核验（查不到 → 拒）", not _ok_w, _why_w)
+
         print("\n[26h] 事件带说话人/渠道/话题 + 链式派工上限 + worker prompt 内联")
         import router as rt4
         ev_u = {"kind": "user.message", "id": "trig-s", "text": "看下审批",

@@ -256,3 +256,86 @@ router 的职责是「语义判断 + 写 Decision」，不是长链推理任务 
 
 - `selftest.py` **303 / 303**（新增 `[26g-6]` 4 条断言：
   贴表情在投 router 之前、异步入口存在、全程加锁）。
+
+---
+
+# 第六轮：企微智能机器人接入（2026-11-19）
+
+## 一、接入方式
+
+企业微信「智能机器人」API 模式，两种接法：
+
+| | 回调（Webhook） | **长连接（WebSocket）** |
+| --- | --- | --- |
+| 公网地址 | **要**（HTTPS 回调地址） | 不要 |
+| 加解密 | 要（Token / EncodingAESKey） | 不要 |
+| 凭据 | Token + EncodingAESKey | **BotID + Secret** |
+
+本机没有公网地址 → 选长连接。端点 `wss://openws.work.weixin.qq.com`，
+凭据校验 `aibot_subscribe`（`body.bot_id` + `body.secret`），
+实测订阅返回 `errcode:0`。
+
+## 二、协议要点
+
+| 动作 | 命令 | 关键字段 |
+| --- | --- | --- |
+| 订阅 | `aibot_subscribe` | `body.bot_id` / `body.secret` |
+| 收消息 | `aibot_msg_callback` | `body.msgid` / `chatid` / `chattype` / `from.userid` / `text.content` |
+| 收事件 | `aibot_event_callback` | `enter_chat` / `template_card_event` / `feedback_event` / `disconnected_event` |
+| 回复 | `aibot_respond_msg` | **必须透传回调帧的 `headers.req_id`**（24h 内有效） |
+| 主动推送 | `aibot_send_msg` | `body.chatid` + `body.chat_type`（1 单聊 / 2 群聊） |
+| 心跳 | `ping` | 应用层命令帧，不是 WebSocket 协议级 ping |
+
+**一个机器人同时只能有一条长连接**（新连接把旧的踢掉）→ 回复必须走守护进程那条连接。
+
+## 三、两个真踩到的坑
+
+### 坑 1：库自带的协议级心跳会把连接掐掉
+
+`websockets` 默认 `ping_interval=20` 会发 WebSocket 协议级 ping。企微网关**不实现 pong**：
+库发一次协议 ping，网关之后解析帧就错了，回一个 close 1002
+`incorrect masking`，连接被掐。
+
+```
+企微长连接已就绪（订阅成功）
+企微长连接读取失败：ConnectionClosedError sent 1002 (protocol error) incorrect masking
+```
+
+实测对比（同一个端点）：
+
+| 组合 | 结果 |
+| --- | --- |
+| 默认 keepalive（协议级 ping） | 20s 后开始异常，40s 报 keepalive ping timeout |
+| `ping_interval=None` + 应用层 `{"cmd":"ping"}` | 稳定运行，`errcode:0` 应答正常 |
+
+→ `connect(..., ping_interval=None)`，心跳改成应用层 `ping` 命令帧。
+
+### 坑 2：接收线程里等应答 = 死等
+
+应答帧只能由接收线程分发。如果在接收线程里发一条命令并等它的应答，
+应答永远等不到自己 → 10s 超时 → 连接被判死。
+
+→ 消息处理与心跳都放到**独立线程**；接收线程只负责「读 + 分发」。
+
+## 四、改动清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `super-agent/wecom_bridge.py` | **新增**：长连接客户端 + 收消息 + 记账 + 投 router + outbox 投递 |
+| `super-agent/wecom_bridge.sh` | **新增**：守护进程脚本（独立进程组；启动前清残留实例） |
+| `super-agent/wecom_config.example.json` | **新增**：去标识化配置模板 |
+| `super-agent/wecom_config.json` | 真实配置（**不入库**） |
+| `core.py` | `resolve_session` 支持 `reply_to`（企微的回复目标是 req_id）；`add_outbox` 的 channel 从任务来源继承 `platform` |
+| `sa.py` | `apply_decision` / `outbox add` 的 channel 跟着来源走，不再写死 `feishu` |
+| `lark_bridge.py` | 投递器只取 `channel=feishu`；遇到别的渠道是**跳过**（原来直接标 cancelled，会把企微回话静默吃掉） |
+| `router.py` | `verify_user_event` 支持 `source=wecom`（也要过账本核验） |
+| `selftest.py` | 新增 `[26i]` 14 条断言 → **317 / 317** |
+
+## 五、验证
+
+- 沙箱演练（`SA_ROOT` 指临时目录）：白名单为空 → 不受理并打出 userid；
+  配好白名单 → 受理 → 记账 → 投 router（`source_ref` 带 `platform=wecom` / `reply_to=req_id`）；
+  重复消息去重；群里不 @ 不受理；@ 前缀剥离正确。
+- 渠道分流：任务来源 `platform=wecom` → outbox 落 `channel=wecom`，
+  飞书投递器取 0 条 / 企微投递器取 2 条；飞书投递器处理企微记录后状态仍是 `pending`（没作废）。
+- 线上：长连接订阅成功；关掉库心跳 + 应用层心跳后，连接稳定运行 90s+ 无掉线。

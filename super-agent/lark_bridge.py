@@ -1437,7 +1437,8 @@ def deliver_outbox() -> int:
     """
     import core
     sent = 0
-    pending = core.pending_outbox()
+    pending = [r for r in core.pending_outbox()
+               if (r.get("channel") or "feishu") == "feishu"]
     # ── 同批结果合并 ──
     # 同一句用户消息派出的多条指派，**复核结果合并成一条**发出去
     # （以前一条指派一条群消息，刷屏且读起来散）。
@@ -1509,7 +1510,8 @@ def _deliver_one(rec: dict, text: str = "", siblings: list | None = None,
     import core
     try:
         if rec.get("channel") != "feishu":
-            core.update_outbox(rec, status="cancelled", note="暂不支持的渠道")
+            # **不是本渠道的记录 → 不碰**（留给对应渠道的桥接投递）。
+            # 以前是直接标 cancelled —— 那会把企微来的回话静默吃掉。
             return 0
         mid = rec.get("reply_to") or ""
         chat = rec.get("chat_id") or ""

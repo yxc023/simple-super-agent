@@ -1056,12 +1056,16 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
                     ref = d
                     break
         sess = core.resolve_session(ob_task, ref.get("chat_id", ""), ref.get("message_id", ""),
-                                    ref.get("thread_id", ""), ref.get("root_id", ""))
+                                    ref.get("thread_id", ""), ref.get("root_id", ""),
+                                    reply_to=ref.get("reply_to", ""))
+        # 渠道跟着来源走：企微来的消息，回话也要回企微（不能被飞书投递器取走）
+        channel = (ref.get("platform", "")
+                   or core.task_source_ref(ob_task).get("platform", "") or "feishu")
         rec = core.add_outbox(
             target=ob.get("target", "thread"), purpose=ob.get("purpose", "reply"),
             text=ob.get("text", ""), task=ob_task,
             assignment=ob.get("assignment", ""),
-            channel="feishu", chat_id=sess["chat_id"],
+            channel=channel, chat_id=sess["chat_id"],
             message_id=sess["reply_to"], sender=sess["sender"],
             # 结果类消息挂上批次 → 桥接把同批的结果**合并成一条**再发，
             # 不再一条指派一条群消息。受理回执/提问/派单回话不挂批次（要立刻发）。
@@ -1211,10 +1215,13 @@ def cmd_outbox_add(a: argparse.Namespace) -> None:
     if not (ref.get("chat_id") or ref.get("message_id")) and a.task:
         ref = core.task_source_ref(a.task)
     sess = core.resolve_session(a.task or "", ref.get("chat_id", ""), ref.get("message_id", ""),
-                                ref.get("thread_id", ""), ref.get("root_id", ""))
+                                ref.get("thread_id", ""), ref.get("root_id", ""),
+                                reply_to=ref.get("reply_to", ""))
+    channel = (ref.get("platform", "")
+               or core.task_source_ref(a.task or "").get("platform", "") or "feishu")
     rec = core.add_outbox(target=a.target, purpose=a.purpose, text=a.text,
                            task=a.task or "", assignment=a.assignment or "",
-                           channel="feishu", chat_id=sess["chat_id"],
+                           channel=channel, chat_id=sess["chat_id"],
                            message_id=sess["reply_to"],
                            sender=sess["sender"],
                            actor=a.actor or os.environ.get("SA_ACTOR") or "human")

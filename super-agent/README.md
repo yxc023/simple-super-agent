@@ -244,6 +244,86 @@ python3 super-agent/seed_demo.py --clear    # 清空全部任务
 
 > 看板服务只绑定 `127.0.0.1`，不对外暴露；所有写操作限制在 `super-agent/` 目录内。
 
+## 企微对接（智能机器人 → 工作指令）
+
+企业微信「智能机器人」**API 模式 · 长连接**接入，和飞书侧同构：
+消息 → 记账 → 投 router → 决策产出 outbox → 按渠道投递器发回渠道。
+
+```
+企微群里 @机器人（或单聊）
+   │
+   ▼  wecom_bridge 长连接（白名单 / @ 判定 / 去重）
+Task（source=wecom，带 platform=wecom）  ──►  主 agent 从 sa.py list 认领
+   │
+   ▼  wecom_bridge 投递 outbox（channel=wecom）
+企微群里回结果
+```
+
+### 为什么是长连接而不是「接收消息回调地址」
+
+回调模式要求一个**公网可访问的 HTTPS 地址**（还要配 Token / EncodingAESKey、
+做加解密）；长连接模式**不需要公网 IP、不需要加解密**，只要 BotID + Secret。
+
+- 端点：`wss://openws.work.weixin.qq.com`
+- 订阅：`aibot_subscribe`（`body.bot_id` + `body.secret`）
+- 收消息：`aibot_msg_callback`（`body.text.content` / `body.from.userid` / `body.chatid`）
+- 回复：`aibot_respond_msg`（**必须透传回调帧的 `headers.req_id`**，24 小时内有效）
+  → 没有 req_id 时退回 `aibot_send_msg`（`body.chatid` + `body.chat_type`）
+- 心跳：每 30s 发一条 `{"cmd":"ping"}` 命令帧（**不是** WebSocket 协议级 ping）
+
+> **两个踩过的坑**（都在 `wecom_bridge.py` 里注释了）：
+> 1. **不能用库自带的协议级心跳**（`ping_interval=None` 必须显式传）：
+>    企微网关不实现 pong，库发一次协议 ping，网关就会把后续帧解析错，
+>    报 1002「incorrect masking」把连接掐掉。改用应用层 `ping` 命令帧就正常。
+> 2. **接收线程不能等应答**：处理消息的过程中可能要发帧并等应答，
+>    而应答只能由接收线程分发 —— 在接收线程里等就是死等。
+>    所以消息处理与心跳都在**独立线程**里跑。
+
+### 渠道分流：outbox 的 channel 决定谁投
+
+同一条 outbox 队列服务多个渠道，**投递器各取各的**：
+
+| 渠道 | 投递器 | 取哪些记录 |
+| --- | --- | --- |
+| 飞书 | `lark_bridge.deliver_outbox()` | `channel=feishu`（含空值的老记录） |
+| 企微 | `wecom_bridge.deliver_outbox()` | `channel=wecom` |
+
+渠道从**任务来源**继承：`source_ref.platform=wecom` 的任务，
+它的回话自动落到 `channel=wecom`，飞书投递器**跳过**（不是作废）。
+
+回复目标也分渠道：飞书用被回复消息的 `message_id`，企微用回调帧的 `req_id`
+（`source_ref.reply_to`）。
+
+### 启动
+
+```bash
+./super-agent/wecom_bridge.sh start     # 常驻长连接
+./super-agent/wecom_bridge.sh status    # 状态
+./super-agent/wecom_bridge.sh logs      # 日志
+./super-agent/wecom_bridge.sh stop
+python3 super-agent/wecom_bridge.py probe   # 只测能不能连上并订阅成功
+```
+
+> ⚠️ **一个机器人同时只允许一条长连接**（新连接会把旧连接踢掉）。
+> 所以：回复必须走**守护进程那条**连接（不能另开），
+> `probe` 会踢掉守护进程 —— 守护进程在跑时别用 probe。
+> `wecom_bridge.sh start` 也会先清残留实例，避免两个进程互踢。
+
+### 触发规则（`wecom_config.json`）
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `bot.bot_id` / `bot.secret` | — | 智能机器人的 BotID 与**长连接 Secret**（不是 Token/EncodingAESKey） |
+| `bot.name` | — | 机器人在群里的显示名，用来精确剥离正文开头的 @ |
+| `senders` | 空 | 白名单 userid 列表；**空 = 谁都不受理**（日志会打出对方的 userid，确认后写进来） |
+| `allow_any_sender` | `false` | `true` = 机器人可见范围内谁说话都受理 |
+| `trigger.group_requires_mention` | `true` | 群里必须 @ 机器人才算在跟它说话 |
+| `trigger.min_length` | `2` | 正文最短字数 |
+| `welcome` | 空 | 用户首次进入单聊时回复的欢迎语 |
+
+> 企微回调里**没有**「被 @ 了没有」的结构化字段，只能看正文开头的 @：
+> 配了 `bot.name` 就精确匹配；没配就兜底剥掉开头任意一个 `@token`。
+
 ## 飞书对接（消息 → 工作指令）
 
 飞书机器人 **「飞书助手」**（app `cli_<app_id>`）在群

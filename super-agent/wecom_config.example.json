@@ -5,7 +5,10 @@
     "name": "@机器人在群里的显示名"
   },
   "senders": [
-    {"userid": "企微成员 userid", "name": "显示名"}
+    {
+      "userid": "企微成员 userid",
+      "name": "显示名"
+    }
   ],
   "allow_any_sender": false,
   "trigger": {
@@ -15,5 +18,12 @@
   "welcome": "您好，我是智能助手，有什么可以帮您？",
   "wss": {
     "endpoint": "wss://openws.work.weixin.qq.com"
+  },
+  "reactions": {
+    "enabled": true,
+    "received": "👌",
+    "dispatched": "💪",
+    "completed": "✅",
+    "suppress_ack_text": true
   }
 }

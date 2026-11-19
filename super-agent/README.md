@@ -320,6 +320,32 @@ python3 super-agent/wecom_bridge.py probe   # 只测能不能连上并订阅成�
 | `trigger.group_requires_mention` | `true` | 群里必须 @ 机器人才算在跟它说话 |
 | `trigger.min_length` | `2` | 正文最短字数 |
 | `welcome` | 空 | 用户首次进入单聊时回复的欢迎语 |
+| `reactions.enabled` | `true` | 是否发「收到 / 加油 / 搞定」表情 |
+| `reactions.received` | `👌` | 收到消息（**在投 router 之前**就发） |
+| `reactions.dispatched` | `💪` | 已派单、处理中 |
+| `reactions.completed` | `✅` | 复核放行、搞定 |
+| `reactions.suppress_ack_text` | `true` | 受理回执用表情代替文字（少一条消息） |
+
+### 企微的「表情」是消息，不是表情回应
+
+企微智能机器人**没有「贴表情回应」这个 API**（实测：`msgtype=reaction` / `emoji`
+都是 `40008 invalid message type`；官方 SDK 里也没有任何 reaction 相关命令）。
+所以这里的「表情」= **发一条只有表情的短消息**（`msgtype=markdown`，内容就一个 emoji）。
+
+- **第一条**走**回复**（`aibot_respond_msg` + 原始 `req_id`）→ 挂在用户那条消息下面；
+- **后续的**走**主动推送**（`aibot_send_msg` + `chatid`）→ 保证是独立的一条，
+  不会把上一条顶掉（同一 req_id 重复回复是否会被当成「改写上一条」不确定，不赌）。
+
+阶段与飞书侧对齐：
+
+| 阶段 | 表情 | 触发时机 |
+| --- | --- | --- |
+| 收到 | 👌 | 消息被受理时（投 router 之前） |
+| 加油 | 💪 | 指派派出去（`assigned`/`running`） |
+| 搞定 | ✅ | **复核放行**（`approved`）—— worker 的 `done` 只是交付，不算完成 |
+
+另外：「router 处理完了但没派单」的消息也会补一个 ✅（45 秒宽限、只回溯 6 小时），
+和飞书侧「没有派单 → 直接标完成」是同一套口径。
 
 > 企微回调里**没有**「被 @ 了没有」的结构化字段，只能看正文开头的 @：
 > 配了 `bot.name` 就精确匹配；没配就兜底剥掉开头任意一个 `@token`。

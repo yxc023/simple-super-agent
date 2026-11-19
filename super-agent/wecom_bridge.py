@@ -68,6 +68,14 @@ RECONNECT_BACKOFF = (2, 5, 10, 20, 30)
 MAX_TEXT_BYTES = 18000      # 企微 markdown 正文上限 20480 字节，留余量
 BATCH_HOLD_MAX_SECONDS = 1800  # 同批结果最多压多久
 
+# ── 表情（企微没有「贴表情回应」这个 API）──
+# 实测：msgtype=reaction / emoji 都是 40008 invalid message type，
+# 企微智能机器人只认 markdown / 模板卡片 / 流式 / 媒体。
+# 所以「贴表情」= **发一条只有表情的短消息**。
+DEFAULT_REACTIONS = {"received": "👌", "dispatched": "💪", "completed": "✅"}
+NO_DISPATCH_GRACE_SECONDS = 45       # router 处理完等多久再判「没派单」
+NO_DISPATCH_WINDOW_HOURS = 6         # 只回溯这个时间窗
+
 _LOCK = threading.RLock()
 
 
@@ -478,12 +486,30 @@ def handle_message(body: dict, req_id: str = "") -> None:
         chats[chat_id] = {"last_req_id": req_id, "last_msg_id": mid, "ts": sa.now(),
                           "chat_type": chat_type}
         save_state(state)
+        # ── 先发「收到」表情，再投 router ──
+        # 用户看到的第一反应应该是「收到了」。企微没有表情回应 API，
+        # 所以这里发一条**只有表情的短消息**。
+        rc = reaction_config()
+        if rc.get("enabled"):
+            threading.Thread(target=_send_received_emoji,
+                             args=(req_id, chat_id, chat_type, rc.get("received", "")),
+                             daemon=True).start()
         try:
             ev = sa.notify("user.message", None, text=text,
                            source_ref=source_ref, source="wecom")
             log(f"企微消息已投 router（trigger {ev.get('id')}）：{text[:50]}")
         except Exception as e:
             log(f"投 router 失败：{e}")
+
+
+def _send_received_emoji(req_id: str, chat_id: str, chat_type: str, emoji: str) -> None:
+    """后台线程：发「收到」表情（不阻塞投 router）。"""
+    try:
+        r = send_emoji(req_id, chat_id, chat_type, emoji)
+        log(f"[企微] 表情 {emoji} → 会话 {chat_id[:12]}（收到）"
+            + ("" if r.get("ok") else f" 失败：{r.get('error', '')}"))
+    except Exception as e:
+        log(f"[企微] 表情发送异常：{str(e)[:120]}")
 
 
 # ------------------------------------------------------------------ 发消息
@@ -560,6 +586,266 @@ def send_message(req_id: str, chat_id: str, chat_type: str, text: str) -> dict:
     return {"ok": resp.get("errcode", 0) == 0, "via": "send", "raw": resp}
 
 
+# ------------------------------------------------------------------ 表情
+
+
+def reaction_config() -> dict:
+    """表情配置（wecom_config.json 的 reactions 段，可整体关掉）。"""
+    try:
+        cfg = load_config().get("reactions") or {}
+    except SystemExit:
+        cfg = {}
+    out = dict(DEFAULT_REACTIONS)
+    for k in DEFAULT_REACTIONS:
+        if cfg.get(k):
+            out[k] = cfg[k]
+    out["enabled"] = bool(cfg.get("enabled", True))
+    # 受理回执（ack）用表情代替文字
+    out["suppress_ack_text"] = bool(cfg.get("suppress_ack_text", True))
+    return out
+
+
+def send_emoji(req_id: str, chat_id: str, chat_type: str, emoji: str) -> dict:
+    """发一条「只有表情」的消息（企微没有表情回应 API）。
+
+    第一条消息走 **回复**（req_id，挂在用户那条消息下面）；
+    后续的都走**主动推送**（chatid）——
+    同一 req_id 重复回复是否会被当成「改写上一条」不确定，
+    主动推送保证是**独立的一条**，不会把上一条顶掉。
+    """
+    if not emoji:
+        return {"ok": False, "error": "空表情"}
+    conn = ACTIVE_CONN
+    if conn is None or conn.ws is None or not conn.subscribed:
+        return {"ok": False, "error": "长连接未就绪"}
+    body = {"msgtype": "markdown", "markdown": {"content": emoji}}
+    if req_id:
+        resp = _send_on(conn, "aibot_respond_msg", body, req_id=req_id)
+        if resp.get("errcode", 0) == 0:
+            return {"ok": True, "via": "respond"}
+    if not chat_id:
+        return {"ok": False, "error": "没有 req_id 也没有 chat_id，无处可发"}
+    send_body = dict(body)
+    send_body["chatid"] = chat_id
+    send_body["chat_type"] = 2 if chat_type == "group" else (1 if chat_type == "single" else 0)
+    resp = _send_on(conn, "aibot_send_msg", send_body)
+    return {"ok": resp.get("errcode", 0) == 0, "via": "send"}
+
+
+def _assignment_stage(a: dict) -> str:
+    """指派现在处在哪个阶段：dispatched（已派出去）/ completed（已闭环）/ 空。
+
+    「完成」= **复核放行**（approved），不是 worker 交付（done）——
+    worker 交付只是「交上来了」，router 还要复核、还要把结果发回给用户。
+    """
+    st = a.get("status") or ""
+    if st in ("assigned", "running"):
+        return "dispatched"
+    if st == "approved":
+        return "completed"
+    return ""
+
+
+def _stage_ts(a: dict, stage: str) -> str:
+    return (a.get("dispatched_at") if stage == "dispatched" else a.get("completed_at")) or ""
+
+
+def _is_recent(ts: str, window_seconds: int = 600) -> bool:
+    """时间戳在最近 window_seconds 内（ISO 字符串）。"""
+    if not ts:
+        return False
+    try:
+        t = _dt.datetime.fromisoformat(str(ts))
+    except (ValueError, TypeError):
+        return False
+    if t.tzinfo is None:
+        t = t.astimezone()
+    return (_dt.datetime.now().astimezone() - t).total_seconds() <= window_seconds
+
+
+def reaction_targets(seen: dict) -> list:
+    """哪些会话该发什么表情（只判断，不发消息）。
+
+    返回 [(chat_id, chat_type, req_id, stage)]。
+    一个阶段只发一次（seen 里记 task:assignment → stage）。
+    """
+    out = []
+    done_chats: set[str] = set()
+    try:
+        task_ids = sa.list_task_ids()
+    except Exception:
+        task_ids = []
+    for tid in task_ids:
+        try:
+            tstate = sa.load_state(tid)
+        except Exception:
+            continue
+        src = tstate.get("source_ref") or {}
+        if (src.get("platform") or "") != "wecom":
+            continue
+        for a in tstate.get("assignments") or []:
+            stage = _assignment_stage(a)
+            if not stage:
+                continue
+            key = f"{tid}:{a.get('id')}"
+            prev = seen.get(key)
+            if prev == stage:
+                continue
+            first_seen = prev is None
+            seen[key] = stage
+            if first_seen and not _is_recent(_stage_ts(a, stage)):
+                continue          # 历史活，不倒灌
+            chat_id = str(src.get("chat_id") or "")
+            if not chat_id or chat_id in done_chats:
+                continue
+            done_chats.add(chat_id)
+            out.append((chat_id, str(src.get("chat_type") or ""),
+                        str(src.get("reply_to") or ""), stage))
+    return out
+
+
+def _router_reply_records(limit: int = 200) -> list[dict]:
+    """router 处理过的消息（读 router/outbox.jsonl 尾部）。"""
+    p = sa.ROUTER_DIR / "outbox.jsonl"
+    if not p.exists():
+        return []
+    out = []
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except OSError:
+        return []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _decision_items(trigger: str) -> list | None:
+    """某个 trigger 的 Decision 派工条目；没有决策文件返回 None。"""
+    if not trigger:
+        return None
+    p = sa.ROUTER_DIR / "decisions" / f"{trigger}.json"
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    sub = d.get("submitted") or {}
+    items = sub.get("items") if isinstance(sub, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _dispatched_message_ids() -> set:
+    """已经派过工的消息 id（指派的 origin_ref，缺了回落任务来源）。"""
+    out = set()
+    try:
+        tids = sa.list_task_ids()
+    except Exception:
+        tids = []
+    for tid in tids:
+        try:
+            tstate = sa.load_state(tid)
+        except Exception:
+            continue
+        src = tstate.get("source_ref") or {}
+        for a in tstate.get("assignments") or []:
+            origin = a.get("origin_ref") or {}
+            mid = origin.get("message_id") or src.get("message_id") or ""
+            if mid:
+                out.add(str(mid))
+    return out
+
+
+def no_dispatch_targets(done_map: dict) -> list:
+    """哪些消息「router 处理完了但没派单」→ 该发「搞定」表情。
+
+    返回 [(chat_id, chat_type, req_id)]。
+    """
+    now_ts = time.time()
+    out = []
+    dispatched = None
+    for rec in _router_reply_records():
+        ev = rec.get("event") or {}
+        if not isinstance(ev, dict) or (ev.get("kind") or "") != "user.message":
+            continue
+        if (ev.get("source") or "") != "wecom":
+            continue
+        ref = ev.get("source_ref") or {}
+        mid = str(ref.get("message_id") or "")
+        if not mid or mid in done_map:
+            continue
+        try:
+            ts = _dt.datetime.fromisoformat(str(rec.get("ts") or "")).timestamp()
+        except (ValueError, TypeError):
+            continue
+        if now_ts - ts < NO_DISPATCH_GRACE_SECONDS:
+            continue
+        if now_ts - ts > NO_DISPATCH_WINDOW_HOURS * 3600:
+            continue
+        trigger = str(ev.get("id") or "")
+        if _decision_items(trigger):
+            continue                      # 派了工 → 走派发/完成那套
+        if dispatched is None:
+            dispatched = _dispatched_message_ids()
+        if mid in dispatched:
+            continue
+        done_map[mid] = True
+        out.append((str(ref.get("chat_id") or ""), str(ref.get("chat_type") or ""),
+                    str(ref.get("reply_to") or "")))
+    return out
+
+
+def reaction_loop() -> None:
+    """表情循环：按指派状态发「加油 / 搞定」，另外补「没派单 → 搞定」。"""
+    while True:
+        try:
+            # 长连接还没就绪时**什么都不做**（也不能先把状态标成「已发」——
+            # 否则连接一上来，这些表情就再也不会发了）。
+            conn = ACTIVE_CONN
+            if conn is not None and conn.ws is not None and conn.subscribed:
+                rc = reaction_config()
+                if rc.get("enabled"):
+                    with _LOCK:
+                        state = load_state()
+                        seen = state.setdefault("reaction_seen", {})
+                        done_map = state.setdefault("no_dispatch_done", {})
+                        targets = reaction_targets(seen)
+                        nd = no_dispatch_targets(done_map)
+                        if targets or nd:
+                            save_state(state)
+                    for chat_id, chat_type, req_id, stage in targets:
+                        emoji = rc.get(stage) or ""
+                        try:
+                            r = send_emoji(req_id, chat_id, chat_type, emoji)
+                        except Exception as e:
+                            log(f"[企微] 表情发送异常：{str(e)[:120]}")
+                            continue
+                        log(f"[企微] 表情 {emoji} → 会话 {chat_id[:12]}（{stage}）"
+                            + ("" if r.get("ok") else f" 失败：{r.get('error', '')}"))
+                    for chat_id, chat_type, req_id in nd:
+                        emoji = rc.get("completed") or ""
+                        try:
+                            r = send_emoji(req_id, chat_id, chat_type, emoji)
+                        except Exception as e:
+                            log(f"[企微] 表情发送异常：{str(e)[:120]}")
+                            continue
+                        log(f"[企微] 表情 {emoji} → 会话 {chat_id[:12]}（没派单，直接完成）"
+                            + ("" if r.get("ok") else f" 失败：{r.get('error', '')}"))
+        except Exception as e:
+            log(f"[企微] 表情循环异常：{str(e)[:160]}")
+        time.sleep(3)
+
+
 # ------------------------------------------------------------------ 投递
 
 
@@ -631,6 +917,13 @@ def _deliver_one(rec: dict, text: str = "", siblings: list | None = None) -> int
                                     "——已进 dead_letter，需补齐会话后人工重投")
             log(f"[企微] outbox {rec['id']} 无可投递会话 → dead_letter")
             return 0
+        # 受理回执改用表情表示 —— 这条文字不再发出去
+        if rec.get("purpose") == "ack" and reaction_config().get("suppress_ack_text"):
+            core.update_outbox(rec, status="suppressed", attempts=rec.get("attempts", 0) + 1,
+                               sent_at=sa.now(),
+                               note="受理回执改用表情表示（收到/加油/搞定，只发表情不发文字）")
+            log(f"[企微] outbox {rec['id']} 是受理回执 → 改用表情，不发文字")
+            return 1
         # 会话类型：单聊 1、群聊 2（决定 chatid 怎么解析）
         src = core.task_source_ref(rec.get("task", "")) if rec.get("task") else {}
         chat_type = src.get("chat_type", "") or ""
@@ -729,7 +1022,7 @@ def cmd_probe(a: argparse.Namespace) -> None:
 
 
 def cmd_follow(a: argparse.Namespace) -> None:
-    """守护进程主循环：长连接 + 投递线程。"""
+    """守护进程主循环：长连接 + 投递线程 + 表情线程。"""
     global ACTIVE_CONN
     cfg = load_config()
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -737,6 +1030,7 @@ def cmd_follow(a: argparse.Namespace) -> None:
     conn = WeComConn(cfg)
     ACTIVE_CONN = conn
     threading.Thread(target=deliver_loop, daemon=True).start()
+    threading.Thread(target=reaction_loop, daemon=True).start()
     log(f"企微桥接启动：bot_id={conn.bot_id[:8]}…（长连接模式）")
     try:
         conn.run_forever()

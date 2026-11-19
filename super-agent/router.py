@@ -142,6 +142,11 @@ def build_prompt(ev: dict) -> str:
             lines.append(f"说话人: {sid}")
         chat = display_chat_name(ref)
         cid = (ref.get("chat_id") or "").strip()
+        platform = str(ref.get("platform") or "").strip()
+        if platform == "wecom":
+            # 企微没有群名（回调里只给 chatid），但渠道本身要说清楚：
+            # 单聊还是群聊，模型才知道该怎么回话。
+            chat = f"企业微信（{ref.get('chat_type') or '未知形态'}）"
         lines.append(f"渠道: {chat}" + (f"（{cid}）" if cid and cid not in chat else ""))
         tid = (ref.get("thread_id") or "").strip()
         rid = (ref.get("root_id") or "").strip()

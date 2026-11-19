@@ -1416,6 +1416,18 @@ def main() -> None:
                                 "message_id": "wm_not_in_ledger"}}
         _ok_w, _why_w = _rt_i.verify_user_event(_ev_w)
         check("企微事件也要过账本核验（查不到 → 拒）", not _ok_w, _why_w)
+        # ── 企微「表情」：协议里没有 reaction，只能发表情短消息 ──
+        check("企微表情三档（收到/加油/搞定）",
+              all(x in _src_i for x in ('"received": "👌"', '"dispatched": "💪"',
+                                        '"completed": "✅"')), "")
+        check("企微表情是发消息（markdown），不是 reaction 类型",
+              '"msgtype": "markdown"' in _src_i and "aibot_respond_msg" in _src_i)
+        check("受理回执改用表情（不发文字）",
+              "suppress_ack_text" in _src_i and 'rec.get("purpose") == "ack"' in _src_i)
+        check("表情阶段：只有 approved 才算完成（done 不提前发「搞定」）",
+              'if st == "approved":' in _src_i and 'if st in ("assigned", "running"):' in _src_i)
+        check("表情循环等长连接就绪再发（否则状态被提前标成已发）",
+              "conn.subscribed" in _src_i and "reaction_seen" in _src_i)
 
         print("\n[26h] 事件带说话人/渠道/话题 + 链式派工上限 + worker prompt 内联")
         import router as rt4

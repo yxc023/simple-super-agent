@@ -339,3 +339,53 @@ router 的职责是「语义判断 + 写 Decision」，不是长链推理任务 
 - 渠道分流：任务来源 `platform=wecom` → outbox 落 `channel=wecom`，
   飞书投递器取 0 条 / 企微投递器取 2 条；飞书投递器处理企微记录后状态仍是 `pending`（没作废）。
 - 线上：长连接订阅成功；关掉库心跳 + 应用层心跳后，连接稳定运行 90s+ 无掉线。
+
+---
+
+# 第七轮：企微的「表情」= 表情消息（2026-11-19）
+
+## 一、协议事实（实测）
+
+企微智能机器人**没有「贴表情回应」这个 API**。实测三种猜法都被拒：
+
+| 试验 | 响应 |
+| --- | --- |
+| `{"msgtype":"reaction","reaction":{...}}` | `40008 invalid message type` |
+| `{"msgtype":"emoji","emoji":{...}}` | `40008 invalid message type` |
+| `aibot_respond_reaction`（未知 cmd） | 服务端**不回应** |
+| `{"msgtype":"text","text":{...}}`（回复） | `40008 invalid message type` ← **text 也不行** |
+| `{"msgtype":"markdown",...}` | `errcode:0` ✓ |
+| 主动推送 `aibot_send_msg`（单聊 chatid=userid, chat_type=1） | `errcode:0` ✓ |
+
+官方命令全集也只有：`aibot_subscribe` / `ping` / `aibot_respond_msg` /
+`aibot_respond_welcome_msg` / `aibot_respond_update_msg` / `aibot_send_msg` /
+`aibot_upload_media_*`，没有 reaction。
+
+> 顺带一个坑：**回复不能用 `msgtype=text`**（只有欢迎语能用 text）。
+> 正文一律走 markdown。
+
+## 二、所以「表情」只能是消息
+
+三档表情（收到 / 加油 / 搞定）→ **发一条只有 emoji 的短消息**：
+
+| 阶段 | 表情 | 时机 | 走哪条通道 |
+| --- | --- | --- | --- |
+| 收到 | 👌 | 受理时（**投 router 之前**，异步发） | `aibot_respond_msg`（原始 req_id）→ 挂在用户消息下面 |
+| 加油 | 💪 | 指派派出去（assigned/running） | `aibot_send_msg`（chatid） |
+| 搞定 | ✅ | **复核放行**（approved） | `aibot_send_msg`（chatid） |
+
+**为什么第一条用回复、后面用主动推送**：同一 req_id 重复回复，
+服务端是「多发一条」还是「改写上一条」没有文档说明，不赌 —— 第一条占住 req_id，
+后面的全走主动推送，保证独立成条。
+
+`suppress_ack_text: true`：受理回执（`purpose=ack`）用表情代替文字，少一条消息。
+
+「router 处理完了但没派单」也补一个 ✅（45s 宽限 / 只回溯 6h），
+与飞书侧「没有派单 → 直接标完成」同一口径。
+
+## 三、验证
+
+- 协议实测（上表全部是真实响应）。
+- 表情循环**等长连接就绪再发**：否则一启动就把状态标成「已发」，
+  连接上来之后这些表情就再也不会发了（第一版就踩了这个）。
+- `selftest` **322 / 322**（新增 `[26i]` 5 条表情相关断言）。

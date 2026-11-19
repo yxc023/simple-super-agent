@@ -326,7 +326,7 @@ def render_instruction(*, task_id: str, assignment_id: str, agent_id: str,
         "- assignment: `" + assignment_id + "`",
         "- agent: `" + agent_id + "`",
         "- status: `done`   # done | failed | blocked | waiting_user_input",
-        "- updated_at: <ISO8601>",
+        "- updated_at: <ISO8601>   # 这一行由系统盖章，worker 不用填",
         "",
         "## 结论",
         "",
@@ -417,7 +417,7 @@ def resolve_session(task_id: str = "", chat_id: str = "", message_id: str = "",
 def add_outbox(*, target: str, purpose: str, text: str, task: str = "",
                assignment: str = "", channel: str = "", chat_id: str = "",
                message_id: str = "", sender: str = "", actor: str = "",
-               dedupe_window_seconds: int = 900) -> dict:
+               batch: str = "", dedupe_window_seconds: int = 900) -> dict:
     """写入一条待发消息。
 
     同一条消息被重复提交（例如 Decision 重投）时不产生第二条 —— 按
@@ -450,6 +450,8 @@ def add_outbox(*, target: str, purpose: str, text: str, task: str = "",
         "text": text,
         "task": task,
         "assignment": assignment,
+        # 批次 id：同一批的结果消息在投递时合并成一条（见 bridge 的 deliver_outbox）
+        "batch": batch or "",
         "channel": channel or "feishu",
         "chat_id": sess["chat_id"],
         "reply_to": sess["reply_to"],

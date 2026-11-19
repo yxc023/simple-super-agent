@@ -30,6 +30,7 @@ import subprocess
 import threading
 import sys
 import time
+import uuid
 import datetime as _dt
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -76,6 +77,13 @@ def _load_config_raw() -> dict:
 
 LOCK_FILE = _state_path("SA_LOCK_FILE", "lark_state.lock")
 
+# 进程内可重入：同一**线程**已持锁时再拿一次不会再卡死
+# （flock 是按「打开的文件描述」生效的，同进程另开 fd 再 flock 会和自己冲突）
+# 注意 owner 必须是**线程**维度：锁文件是跨进程共享的，
+# 若只记「本进程已持锁」，另一个线程会误以为自己持锁 → 两个线程同时写状态。
+_LOCK_DEPTH = 0
+_LOCK_OWNER = None
+
 
 @contextlib.contextmanager
 def state_lock(wait_seconds: float = 0.0):
@@ -83,7 +91,18 @@ def state_lock(wait_seconds: float = 0.0):
 
     wait_seconds > 0 时会等待锁，而不是立刻放弃 —— 事件订阅模式下，
     官方要求 3 秒内处理完事件，抢不到锁就丢弃会造成消息丢失。
+
+    **同线程可重入**：已经持锁时再进入只是加深计数，不会自锁。
     """
+    global _LOCK_DEPTH, _LOCK_OWNER
+    me = threading.get_ident()
+    if _LOCK_OWNER == me and _LOCK_DEPTH > 0:
+        _LOCK_DEPTH += 1
+        try:
+            yield True
+        finally:
+            _LOCK_DEPTH -= 1
+        return
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     # "a+" 而不是 "w"：flock 只关心 inode，"w" 会在拿到锁之前就把文件截断
     with LOCK_FILE.open("a+") as f:
@@ -102,9 +121,13 @@ def state_lock(wait_seconds: float = 0.0):
             print("另一个 lark_bridge 正在处理消息，本次跳过", file=sys.stderr)
             yield False
             return
+        _LOCK_DEPTH = 1
+        _LOCK_OWNER = me
         try:
             yield True
         finally:
+            _LOCK_DEPTH = 0
+            _LOCK_OWNER = None
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
@@ -140,11 +163,24 @@ def load_state() -> dict:
 
 
 def save_state(st: dict) -> None:
-    """原子写状态：临时文件 + os.replace，避免读者读到半截 JSON。"""
+    """原子写状态：临时文件 + os.replace，避免读者读到半截 JSON。
+
+    临时文件名带 pid + 随机后缀：**固定名会撞**。
+    桥接里同时有三个写者（事件线程、轮询线程、表情同步线程），
+    固定 tmp 名时一个线程刚写完、另一个线程已经把 tmp 改走了，
+    os.replace 就报 "No such file or directory"（已实际发生过一次）。
+    """
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, STATE_FILE)
+    tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:6]}")
+    try:
+        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def write_pid_file() -> None:
@@ -962,11 +998,16 @@ def discover_thread(tid: str, root_id: str, thread_index: dict) -> str:
 
 
 def _assignment_stage(a: dict) -> str:
-    """指派现在处在哪个阶段：dispatched（已派出去）/ completed（已完成）/ 空。"""
+    """指派现在处在哪个阶段：dispatched（已派出去）/ completed（已闭环）/ 空。
+
+    「完成」= **复核放行**（approved），不是 worker 交付（done）——
+    worker 交付只是「交上来了」，router 还要复核、还要把结果发回给用户。
+    在 done 就挂 ✅ 会让用户以为已经结束，结果还得再等几十秒才收到回复。
+    """
     st = a.get("status") or ""
     if st in ("assigned", "running"):
         return "dispatched"
-    if st in ("done", "approved"):
+    if st == "approved":
         return "completed"
     return ""
 
@@ -1069,12 +1110,36 @@ def sync_no_dispatch_reactions() -> int:
     rc = reaction_config()
     if not rc.get("enabled"):
         return 0
-    st = load_state()
-    done_map = st.get("no_dispatch_done")
-    if not isinstance(done_map, dict):
-        done_map = {}
-    now_ts = time.time()
+    # 分三段：**状态读写持锁，表情 API 调用不持锁**。
+    # 表情一次 1~4 秒，持着锁调会把事件线程的消息受理也堵住。
+    with state_lock() as got:
+        if not got:
+            return 0
+        st = load_state()
+        done_map = st.get("no_dispatch_done")
+        if not isinstance(done_map, dict):
+            done_map = {}
+        targets = _no_dispatch_targets(done_map)
     added = 0
+    ok_map = dict(done_map)
+    for mid, trigger in targets:
+        if react(mid, rc.get("completed") or "DONE"):
+            added += 1
+            log(f"无派单 → 直接标完成：{mid}")
+            ok_map[mid] = {"ts": sa.now(), "trigger": trigger}
+    if added:
+        with state_lock() as got:
+            if got:
+                st = load_state()
+                st["no_dispatch_done"] = ok_map
+                save_state(st)
+    return added
+
+
+def _no_dispatch_targets(done_map: dict) -> list:
+    """哪些消息「没有派单、该标完成」（只判断，不改状态、不调 API）。"""
+    now_ts = time.time()
+    out = []
     dispatched = None      # 懒加载：消息多的时候不用每次都扫全部任务
     for rec in _router_reply_records():
         ev = rec.get("event") or {}
@@ -1103,14 +1168,8 @@ def sync_no_dispatch_reactions() -> int:
             dispatched = _dispatched_message_ids()
         if mid in dispatched:
             continue                      # 已经派过工（Decision 还没落盘的情况）
-        if react(mid, rc.get("completed") or "DONE"):
-            added += 1
-            log(f"无派单 → 直接标完成：{mid}")
-        done_map[mid] = {"ts": sa.now(), "trigger": trigger}
-    if done_map:
-        st["no_dispatch_done"] = done_map
-        save_state(st)
-    return added
+        out.append((mid, trigger))
+    return out
 
 
 def sync_reactions() -> int:
@@ -1128,11 +1187,50 @@ def sync_reactions() -> int:
     rc = reaction_config()
     if not rc.get("enabled"):
         return 0
-    st = load_state()
-    seen = st.get("reaction_seen")
-    if not isinstance(seen, dict):
-        seen = {}
+    # 分三段：**状态读写持锁，表情 API 调用不持锁**（见 sync_no_dispatch_reactions）
+    with state_lock() as got:
+        if not got:
+            return 0
+        st = load_state()
+        seen = st.get("reaction_seen")
+        if not isinstance(seen, dict):
+            seen = {}
+        done_map = st.get("no_dispatch_done")
+        if not isinstance(done_map, dict):
+            done_map = {}
+        targets = _reaction_targets(seen)
+        st["reaction_seen"] = seen
+        save_state(st)
     added = 0
+    for mid, stage in targets:
+        # 这条消息之前被标过「无派单 → 完成」，现在真的派了工：
+        # 撤掉那个 ✅，让派发表情能正常挂上去
+        if mid in done_map:
+            _clear_done_reaction(mid)
+        if react(mid, rc[stage]):
+            added += 1
+    if added and done_map:
+        with state_lock() as got:
+            if got:
+                st = load_state()
+                dm = st.get("no_dispatch_done")
+                if isinstance(dm, dict):
+                    for mid, _ in targets:
+                        dm.pop(mid, None)
+                    st["no_dispatch_done"] = dm
+                    save_state(st)
+    return added
+
+
+def _reaction_targets(seen: dict) -> list:
+    """哪些消息该挂什么表情（只判断，不调 API）。
+
+    返回 [(message_id, stage)]，同一轮内**一条消息只出一个**：
+    同一条用户消息可能挂多个指派（同一句话派了几件事），
+    按指派逐个调表情 API 会重复调用（每次 1~4 秒）还刷屏。
+    """
+    out = []
+    done_msgs: set[str] = set()
     try:
         task_ids = [t for t in sa.list_task_ids()]
     except Exception:
@@ -1162,18 +1260,12 @@ def sync_reactions() -> int:
             mid = origin.get("message_id") or src.get("message_id") or ""
             if not mid:
                 continue
-            # 这条消息之前被标过「无派单 → 完成」，现在真的派了工：
-            # 撤掉那个 ✅，让派发表情能正常挂上去
-            done_map = st.get("no_dispatch_done")
-            if isinstance(done_map, dict) and mid in done_map:
-                _clear_done_reaction(str(mid))
-                done_map.pop(mid, None)
-                st["no_dispatch_done"] = done_map
-            if react(mid, rc[stage]):
-                added += 1
-    st["reaction_seen"] = seen
-    save_state(st)
-    return added
+            mid = str(mid)
+            if mid in done_msgs:
+                continue          # 这条消息本轮已经挂过表情了
+            done_msgs.add(mid)
+            out.append((mid, stage))
+    return out
 
 
 def reaction_log(limit: int = 20) -> list[dict]:
@@ -1246,80 +1338,150 @@ def deliver_outbox() -> int:
     """
     import core
     sent = 0
-    for rec in core.pending_outbox():
-        try:
-            if rec.get("channel") != "feishu":
-                core.update_outbox(rec, status="cancelled", note="暂不支持的渠道")
-                continue
-            mid = rec.get("reply_to") or ""
-            chat = rec.get("chat_id") or ""
-            if not mid and not chat:
-                # 记录本身没有会话标识 → 从任务来源继承（Decision 生成的 ack 最容易缺）
-                sess = core.resolve_session(rec.get("task", ""))
-                mid = sess.get("reply_to") or ""
-                chat = sess.get("chat_id") or ""
-                if mid or chat:
-                    core.update_outbox(rec, chat_id=chat, reply_to=mid,
-                                       session_source=sess.get("session_source", "task.source_ref"),
-                                       note="已从任务来源继承会话标识")
-                    log(f"outbox {rec['id']} 已从任务来源继承会话标识")
-            if not mid and not chat:
-                # 确实无处可投 → 不静默丢弃：进 dead_letter（看板可见，可人工重投）
-                core.update_outbox(rec, status="dead_letter",
-                                   attempts=rec.get("attempts", 0) + 1,
-                                   needs_manual=True,
-                                   note="没有可投递的会话（缺 chat_id/reply_to）"
-                                        "——已进 dead_letter，需补齐会话后人工重投")
-                log(f"outbox {rec['id']} 无可投递会话 → dead_letter（需人工重投）")
-                continue
-            # 受理回执改用表情表示 —— 这条文字不再发出去
-            if rec.get("purpose") == "ack" and reaction_config().get("suppress_ack_text"):
-                core.update_outbox(rec, status="suppressed", attempts=rec.get("attempts", 0) + 1,
-                                   sent_at=sa.now(),
-                                   note="受理回执改用表情表示（收到/分配只发表情，不发文字）")
-                log(f"outbox {rec['id']} 是受理回执 → 改用表情，不发文字")
-                sent += 1
-                continue
-            via = "reply" if mid else "send"
-            resp = send_reply(mid, rec["text"]) if mid else send_text(chat, rec["text"])
-            # ── 真渠道校验：桩 / 被替换的客户端一律不算投递成功 ──
-            if not isinstance(resp, dict):
-                raise RuntimeError(
-                    f"渠道客户端没有返回可核验的响应（{type(resp).__name__}）——不写 succeeded")
-            if not resp.get("ok", False):
-                raise RuntimeError(f"渠道返回未成功：{str(resp)[:160]}")
-            receipt = delivery_receipt(resp)
-            # 回话在话题里 → 话题 id 回写到任务（主频道消息的任务也能带上话题了）
-            thread_id = ""
-            if via == "reply" and receipt["message_id"]:
-                thread_id = resolve_thread_id(receipt["message_id"])
-            core.update_outbox(rec, status="succeeded", attempts=rec.get("attempts", 0) + 1,
-                               sent_at=sa.now(),
-                               delivery={"channel": "feishu", "via": via,
-                                         "message_id": receipt["message_id"],
-                                         "request_id": receipt["request_id"],
-                                         "thread_id": thread_id,
-                                         "at": sa.now(),
-                                         "verified": receipt["verified"]})
-            if thread_id:
-                _bind_thread_to_task(rec, thread_id)
-            sent += 1
-            cred = receipt["message_id"] or receipt["request_id"] or "无凭据"
-            log(f"outbox 已投递 {rec['id']}（{rec['purpose']}）凭据={cred}")
-            if rec.get("task"):
-                sa.log_event(rec["task"], "outbox_sent", "outbox",
-                             f"{rec['purpose']} 已发回渠道", outbox_id=rec["id"],
-                             receipt=receipt["message_id"] or receipt["request_id"])
-        except Exception as e:
-            attempts = rec.get("attempts", 0) + 1
-            status = "dead_letter" if attempts >= 3 else "pending"
-            core.update_outbox(rec, status=status, attempts=attempts,
-                               last_error=str(e)[:200],
-                               next_run_at=sa.now(),
-                               note=("重试耗尽，需人工处理" if status == "dead_letter"
-                                     else "投递失败，将重试"))
-            log(f"outbox 投递失败 {rec['id']}：{e}（{status}）")
+    pending = core.pending_outbox()
+    # ── 同批结果合并 ──
+    # 同一句用户消息派出的多条指派，**复核结果合并成一条**发出去
+    # （以前一条指派一条群消息，刷屏且读起来散）。
+    # 只有 purpose=result 的消息进批次；受理回执/提问/派单回话要立刻发，不进。
+    groups: dict[str, list[dict]] = {}
+    singles: list[dict] = []
+    for rec in pending:
+        b = (rec.get("batch") or "").strip()
+        if b and (rec.get("purpose") or "") == "result":
+            groups.setdefault(b, []).append(rec)
+        else:
+            singles.append(rec)
+    for rec in singles:
+        sent += _deliver_one(rec)
+    for b, recs in groups.items():
+        sent += _deliver_batch(b, recs)
     return sent
+
+
+# 结果消息最多压多久（秒）—— 到点还没等齐就照发，不能一直压着不回话
+BATCH_HOLD_MAX_SECONDS = 1800
+
+
+def _record_age_seconds(rec: dict) -> float:
+    try:
+        created = _dt.datetime.fromisoformat(str(rec.get("created_at") or ""))
+    except (ValueError, TypeError):
+        return 0.0
+    return (_dt.datetime.now().astimezone() - created).total_seconds()
+
+
+def _deliver_batch(batch_id: str, recs: list[dict]) -> int:
+    """把同一批的结果消息**合并成一条**发出去。
+
+    等齐条件：这一批没有还在跑/待复核的指派了。
+    等不齐时先**暂存**（不投递），等最后一条完成再合并发 —— 用户只收一条。
+    兜底：压过 BATCH_HOLD_MAX_SECONDS 还没等齐，照发（不能无限期压着）。
+    """
+    st = sa.batch_status(batch_id)
+    expired = any(_record_age_seconds(r) > BATCH_HOLD_MAX_SECONDS for r in recs)
+    if st.get("total", 0) == 0:
+        # 批次里找不到任何指派（老数据没记 batch_id / 批次对不上）→ 不压着，直接发
+        pass
+    elif not st.get("complete") and not expired:
+        log(f"批次 {batch_id[:12]} 还有 {st.get('in_flight')} 条在跑 → 结果暂存，等齐合并发")
+        return 0
+    recs = sorted(recs, key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")))
+    text = "\n\n".join((r.get("text") or "").strip() for r in recs if (r.get("text") or "").strip())
+    if not text:
+        for r in recs:
+            core.update_outbox(r, status="cancelled", note="批次合并时正文为空")
+        return 0
+    return _deliver_one(recs[0], text=text, siblings=recs[1:])
+
+
+def _deliver_one(rec: dict, text: str = "", siblings: list | None = None) -> int:
+    """投递一条 outbox 记录。
+
+    siblings 非空时：正文用 text（合并后的），投递成功后**所有**记录一起标成功
+    （它们共享同一条渠道消息的凭据）。
+    """
+    import core
+    try:
+        if rec.get("channel") != "feishu":
+            core.update_outbox(rec, status="cancelled", note="暂不支持的渠道")
+            return 0
+        mid = rec.get("reply_to") or ""
+        chat = rec.get("chat_id") or ""
+        if not mid and not chat:
+            # 记录本身没有会话标识 → 从任务来源继承（Decision 生成的 ack 最容易缺）
+            sess = core.resolve_session(rec.get("task", ""))
+            mid = sess.get("reply_to") or ""
+            chat = sess.get("chat_id") or ""
+            if mid or chat:
+                core.update_outbox(rec, chat_id=chat, reply_to=mid,
+                                   session_source=sess.get("session_source", "task.source_ref"),
+                                   note="已从任务来源继承会话标识")
+                log(f"outbox {rec['id']} 已从任务来源继承会话标识")
+        if not mid and not chat:
+            # 确实无处可投 → 不静默丢弃：进 dead_letter（看板可见，可人工重投）
+            core.update_outbox(rec, status="dead_letter",
+                               attempts=rec.get("attempts", 0) + 1,
+                               needs_manual=True,
+                               note="没有可投递的会话（缺 chat_id/reply_to）"
+                                    "——已进 dead_letter，需补齐会话后人工重投")
+            log(f"outbox {rec['id']} 无可投递会话 → dead_letter（需人工重投）")
+            return 0
+        # 受理回执改用表情表示 —— 这条文字不再发出去
+        if rec.get("purpose") == "ack" and reaction_config().get("suppress_ack_text"):
+            core.update_outbox(rec, status="suppressed", attempts=rec.get("attempts", 0) + 1,
+                               sent_at=sa.now(),
+                               note="受理回执改用表情表示（收到/分配只发表情，不发文字）")
+            log(f"outbox {rec['id']} 是受理回执 → 改用表情，不发文字")
+            return 1
+        body = text or (rec.get("text") or "")
+        via = "reply" if mid else "send"
+        resp = send_reply(mid, body) if mid else send_text(chat, body)
+        # ── 真渠道校验：桩 / 被替换的客户端一律不算投递成功 ──
+        if not isinstance(resp, dict):
+            raise RuntimeError(
+                f"渠道客户端没有返回可核验的响应（{type(resp).__name__}）——不写 succeeded")
+        if not resp.get("ok", False):
+            raise RuntimeError(f"渠道返回未成功：{str(resp)[:160]}")
+        receipt = delivery_receipt(resp)
+        # 回话在话题里 → 话题 id 回写到任务（主频道消息的任务也能带上话题了）
+        thread_id = ""
+        if via == "reply" and receipt["message_id"]:
+            thread_id = resolve_thread_id(receipt["message_id"])
+        delivery = {"channel": "feishu", "via": via,
+                    "message_id": receipt["message_id"],
+                    "request_id": receipt["request_id"],
+                    "thread_id": thread_id,
+                    "at": sa.now(),
+                    "verified": receipt["verified"]}
+        group = [rec] + list(siblings or [])
+        merged = len(group) > 1
+        for r in group:
+            fields = {"status": "succeeded", "attempts": r.get("attempts", 0) + 1,
+                      "sent_at": sa.now(), "delivery": delivery}
+            if merged:
+                fields["note"] = "与同批其它结果合并成一条发出"
+            core.update_outbox(r, **fields)
+        if thread_id:
+            _bind_thread_to_task(rec, thread_id)
+        cred = receipt["message_id"] or receipt["request_id"] or "无凭据"
+        log(f"outbox 已投递 {rec['id']}（{rec['purpose']}）凭据={cred}"
+            + (f"（同批 {len(group)} 条合并为一条）" if merged else ""))
+        if rec.get("task"):
+            sa.log_event(rec["task"], "outbox_sent", "outbox",
+                         f"{rec['purpose']} 已发回渠道", outbox_id=rec["id"],
+                         receipt=receipt["message_id"] or receipt["request_id"],
+                         merged_count=len(group) if merged else 1)
+        return 1
+    except Exception as e:
+        attempts = rec.get("attempts", 0) + 1
+        status = "dead_letter" if attempts >= 3 else "pending"
+        core.update_outbox(rec, status=status, attempts=attempts,
+                           last_error=str(e)[:200],
+                           next_run_at=sa.now(),
+                           note=("重试耗尽，需人工处理" if status == "dead_letter"
+                                 else "投递失败，将重试"))
+        log(f"outbox 投递失败 {rec['id']}：{e}（{status}）")
+    return 0
 
 
 def poll_once(cfg: dict, state: dict, dry_run: bool = False, mode: str = "pull") -> list[dict]:
@@ -1576,6 +1738,68 @@ def poll_once(cfg: dict, state: dict, dry_run: bool = False, mode: str = "pull")
     return accepted
 
 
+def _outbox_signature() -> tuple:
+    """outbox 目录的「有没有新东西」指纹（目录 mtime + 条目数）。
+
+    投递循环靠它决定要不要做一次全量扫描 —— 否则每秒扫一遍几百个 outbox
+    文件只是白烧 IO。
+    """
+    import core
+    try:
+        st = os.stat(core.OUTBOX_DIR)
+        return (st.st_mtime_ns, st.st_ino)
+    except OSError:
+        return (0, 0)
+
+
+def deliver_loop() -> None:
+    """outbox 投递循环：**1 秒一 tick**，目录变了就立刻投。
+
+    以前是 5 秒一 tick 且和表情同步串在同一个线程里 ——
+    router 提交 Decision 到用户收到回复，最坏要等 9 秒。
+    """
+    last_sig = None
+    ticks = 0
+    while True:
+        try:
+            sig = _outbox_signature()
+            ticks += 1
+            # 目录变了就投；没变也每 15 秒兜底投一次（重试回 pending 不改目录 mtime）
+            if sig != last_sig or ticks % 15 == 0:
+                last_sig = sig
+                deliver_outbox()
+        except Exception as e:
+            log(f"outbox 投递异常: {e}")
+        time.sleep(1)
+
+
+def reaction_loop() -> None:
+    """表情同步循环（独立线程，不挡 outbox 投递）。"""
+    while True:
+        try:
+            sync_reactions()
+        except Exception as e:
+            log(f"表情同步异常: {e}")
+        try:
+            sync_no_dispatch_reactions()
+        except Exception as e:
+            log(f"无派单表情同步异常: {e}")
+        time.sleep(3)
+
+
+def start_delivery_threads() -> None:
+    """启动投递线程与表情线程（幂等：已启动就不再重复起）。"""
+    global _BG_THREADS_STARTED
+    if _BG_THREADS_STARTED:
+        return
+    _BG_THREADS_STARTED = True
+    threading.Thread(target=deliver_loop, daemon=True).start()
+    threading.Thread(target=reaction_loop, daemon=True).start()
+
+
+_BG_THREADS_STARTED = False
+
+
 def cmd_follow(a: argparse.Namespace) -> None:
     """守护进程主循环：**官方事件订阅（长连接）为主，轮询为兜底**。
 
@@ -1627,23 +1851,11 @@ def cmd_follow(a: argparse.Namespace) -> None:
         return
 
     # 后台线程：持续投递 outbox（回复/回执）
-    def deliver_loop():
-        while True:
-            try:
-                deliver_outbox()
-            except Exception as e:
-                log(f"outbox 投递异常: {e}")
-            try:
-                sync_reactions()
-            except Exception as e:
-                log(f"表情同步异常: {e}")
-            try:
-                sync_no_dispatch_reactions()
-            except Exception as e:
-                log(f"无派单表情同步异常: {e}")
-            time.sleep(5)
+    # 投递与表情**分开两个线程**：表情 API 一次要 1~4 秒，
+    # 跟投递挤在一个线程里会直接推迟用户回复（实测拖过 5~9 秒）。
+    start_delivery_threads()
 
-    threading.Thread(target=deliver_loop, daemon=True).start()
+
 
     # ── 进入事件模式：把运行态写准 ──
     # 之前事件模式不写 mode/last_poll/started_at，看板上「最近拉取时间」
@@ -1763,6 +1975,9 @@ def cmd_pull(a: argparse.Namespace) -> None:
         log(f"轮询启动，间隔 {cfg.get('poll', {}).get('interval_seconds', 20)}s，Ctrl+C 退出")
         log(f"启动时间闸门：只处理 {sa.now()} 之后（±{grace}s 宽限）收到的消息，"
             f"更早的一律标记已读")
+        # 投递与表情走后台线程（与事件模式同一套）——
+        # 不然一条回复要等下一轮轮询（默认 20s）才发得出去。
+        start_delivery_threads()
         try:
             while True:
                 try:
@@ -1773,9 +1988,6 @@ def cmd_pull(a: argparse.Namespace) -> None:
                         state = load_state()      # 每轮重读，避免和别的进程互相覆盖
                         poll_once(cfg, state)
                         save_state(state)
-                        deliver_outbox()          # 顺带投递待发消息
-                        sync_reactions()          # 顺带补表情（派发/完成）
-                        sync_no_dispatch_reactions()   # 没派单的直接标完成
                 except Exception as e:
                     log(f"轮询异常: {e}")
                 time.sleep(cfg.get("poll", {}).get("interval_seconds", 20))

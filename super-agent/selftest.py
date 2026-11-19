@@ -1035,7 +1035,11 @@ def main() -> None:
         import lark_bridge as lb2
         import datetime as _dt2
         lb_state_file, lb_log_file = lb2.STATE_FILE, lb2.LOG_FILE
+        lb_lock_file = lb2.LOCK_FILE
         lb2.STATE_FILE = tmp / "nodispatch_state.json"
+        # 锁文件也要指到沙箱：否则会和生产桥接的锁抢（事件线程正在处理消息时锁被占着，
+        # 非阻塞拿不到锁 → 表情同步直接跳过 → 用例随机失败）
+        lb2.LOCK_FILE = tmp / "nodispatch.lock"
         lb2.LOG_FILE = tmp / "nodispatch_bridge.log"
         _calls = []
         _orig_react = lb2.react
@@ -1097,6 +1101,178 @@ def main() -> None:
         finally:
             lb2.react = _orig_react
             lb2.STATE_FILE, lb2.LOG_FILE = lb_state_file, lb_log_file
+            lb2.LOCK_FILE = lb_lock_file
+
+        print("\n[26g-3] 批次：同批结果合并成一条 + 表情去重 + 完成语义")
+        import lark_bridge as lb3
+        # ── 批次：同一条用户消息派出的多条指派 = 同一批 ──
+        _bt = sa.TASKS_DIR / "T910"
+        (_bt / "context").mkdir(parents=True, exist_ok=True)
+        (_bt / "state.json").write_text(json.dumps({
+            "task_id": "T910", "title": "批次任务", "goal": "g", "status": "dispatched",
+            "created_at": "2026-11-19T15:00:00+08:00", "updated_at": "2026-11-19T15:00:00+08:00",
+            "source_ref": {"message_id": "om_batch_1"},
+            "assignments": [
+                {"id": "A01", "worker": "general-purpose", "status": "approved",
+                 "batch_id": "om_batch_1", "artifacts": ["/tmp/a.md"], "review": "approved"},
+                {"id": "A02", "worker": "general-purpose", "status": "running",
+                 "batch_id": "om_batch_1", "artifacts": []},
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+        bst = sa.batch_status("om_batch_1")
+        check("批次能查到指派", bst.get("total") == 2, str(bst))
+        check("还有在跑的 → 批次未完", bst.get("complete") is False and bst.get("in_flight") == 1,
+              str(bst))
+        _bt2 = sa.TASKS_DIR / "T911"
+        (_bt2 / "context").mkdir(parents=True, exist_ok=True)
+        (_bt2 / "state.json").write_text(json.dumps({
+            "task_id": "T911", "title": "兄弟任务", "goal": "g", "status": "dispatched",
+            "created_at": "2026-11-19T15:00:00+08:00", "updated_at": "2026-11-19T15:00:00+08:00",
+            "source_ref": {"message_id": "om_batch_1"},
+            "assignments": [{"id": "A01", "worker": "general-purpose", "status": "approved",
+                             "batch_id": "om_batch_1", "artifacts": ["/tmp/b.md"],
+                             "review": "approved"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        bst2 = sa.batch_status("om_batch_1")
+        check("跨任务的同批指派都算一批", bst2.get("total") == 3, str(bst2))
+
+        # ── 真实路径：Decision → 指派带 batch_id → 结果消息挂 batch ──
+        _orig_dir0 = core.OUTBOX_DIR
+        core.OUTBOX_DIR = tmp / "outbox_dec"
+        try:
+            _round = sa.ROUTER_DIR / "round.json"
+            _round.parent.mkdir(parents=True, exist_ok=True)
+            _round.write_text(json.dumps({
+                "kind": "user.message", "task": "",
+                "source_ref": {"message_id": "om_batch_2", "chat_id": "oc_" + "c" * 32},
+            }, ensure_ascii=False), encoding="utf-8")
+            _doc_dispatch = {
+                "schemaVersion": 2, "triggerId": "trig-batch-dispatch",
+                "_round_kind": "user.message",
+                "items": [{"triggerId": "trig-batch-dispatch", "taskAction": "create",
+                           "taskId": "", "agentId": "general-purpose",
+                           "goal": "批次验证", "requirements": [], "acceptance": ["ok"],
+                           "confidence": 0.9, "reason": "实现", "rationale": "测批次"}],
+                "reviews": [], "outbox": [],
+            }
+            _res_d = sa.apply_decision("", _doc_dispatch, actor="router")
+            _new_task = ""
+            for _ap2 in _res_d.get("applied", []):
+                if _ap2.get("kind") == "task.create":
+                    _new_task = _ap2["task"]
+            check("Decision 新建了任务", bool(_new_task), str(_res_d.get("applied")))
+            _ast = sa.load_state(_new_task)
+            check("指派记下了批次 id（= 触发它的那条用户消息）",
+                  _ast["assignments"][0].get("batch_id") == "om_batch_2",
+                  str(_ast["assignments"][0].get("batch_id")))
+            # 复核 Decision：放行 + 发结果 → 结果消息应挂上批次
+            _ast["assignments"][0]["artifacts"] = ["/tmp/batch.md"]
+            sa.save_state(_new_task, _ast)
+            _round.write_text(json.dumps({
+                "kind": "assignment.completed", "task": _new_task,
+                "source_ref": {"message_id": "om_batch_2", "chat_id": "oc_" + "c" * 32},
+            }, ensure_ascii=False), encoding="utf-8")
+            _doc_review = {
+                "schemaVersion": 2, "triggerId": "trig-batch-review",
+                "_round_kind": "assignment.completed",
+                "items": [],
+                "reviews": [{"assignment": _ast["assignments"][0]["id"],
+                             "verdict": "approve", "note": "核对通过"}],
+                "outbox": [{"target": "thread", "purpose": "result", "text": "批次任务已完成"}],
+            }
+            sa.apply_decision(_new_task, _doc_review, actor="router")
+            _ob_recs = [r for r in core.list_outbox() if r.get("purpose") == "result"]
+            check("结果消息挂上了批次 id",
+                  bool(_ob_recs) and _ob_recs[0].get("batch") == "om_batch_2",
+                  str([(r.get("purpose"), r.get("batch")) for r in _ob_recs]))
+        finally:
+            core.OUTBOX_DIR = _orig_dir0
+
+        # ── 同批结果消息：等齐 → 合并成一条 ──
+        core.OUTBOX_DIR = tmp / "outbox_batch"
+        _sent = []
+        _orig_send = lb3.send_reply
+        lb3.send_reply = lambda mid, text: (_sent.append((mid, text)),
+                                            {"ok": True, "message_id": "om_x"})[1]
+        try:
+            r1 = core.add_outbox(target="thread", purpose="result", text="T876 已完成",
+                                 task="T910", assignment="A01", batch="om_batch_1",
+                                 chat_id="oc_" + "c" * 32, message_id="om_reply_1",
+                                 dedupe_window_seconds=0)
+            lb3.deliver_outbox()
+            check("同批还有指派在跑 → 结果暂存不投递", _sent == [], str(_sent))
+            # 把兄弟指派也置为已闭环 → 批次齐了（直接改文件，避开 task.md 渲染）
+            _st = json.loads((_bt / "state.json").read_text(encoding="utf-8"))
+            for _a in _st["assignments"]:
+                _a["status"] = "approved"
+            (_bt / "state.json").write_text(json.dumps(_st, ensure_ascii=False), encoding="utf-8")
+            r2 = core.add_outbox(target="thread", purpose="result", text="T875 全部完成",
+                                 task="T911", assignment="A01", batch="om_batch_1",
+                                 chat_id="oc_" + "c" * 32, message_id="om_reply_1",
+                                 dedupe_window_seconds=0)
+            lb3.deliver_outbox()
+            check("批次齐了 → 合并成一条发出", len(_sent) == 1, str(_sent))
+            check("合并后的正文含两条结果",
+                  len(_sent) == 1 and "T876 已完成" in _sent[0][1] and "T875 全部完成" in _sent[0][1],
+                  str(_sent))
+            _rc = core.list_outbox()
+            check("两条记录都标成功（共享凭据）",
+                  all(x["status"] == "succeeded" for x in _rc), str([x["status"] for x in _rc]))
+        finally:
+            lb3.send_reply = _orig_send
+            core.OUTBOX_DIR = _orig_dir0
+
+
+        # ── 表情：一条消息多个指派只挂一个 ──
+        _calls2 = []
+        _orig_react2 = lb3.react
+        lb3.react = lambda mid, emoji: (_calls2.append((mid, emoji)), True)[1]
+        _st2 = lb3.load_state()
+        _st2["reaction_seen"] = {}
+        lb3.save_state(_st2)
+        try:
+            lb3._reaction_targets({})
+            check("一条消息多个指派 → 只出一个表情目标", len(_calls2) == 0, str(_calls2))
+            tgt = lb3._reaction_targets({})
+            check("同批同消息只留一个目标", len({t[0] for t in tgt}) == len(tgt), str(tgt))
+        finally:
+            lb3.react = _orig_react2
+
+        # ── 完成语义：done（worker 交付）不算完成，approved（复核放行）才算 ──
+        check("done 不再算完成（避免「已完成」后又等 30 秒）",
+              lb3._assignment_stage({"status": "done"}) == "",
+              str(lb3._assignment_stage({"status": "done"})))
+        check("approved 才算完成",
+              lb3._assignment_stage({"status": "approved"}) == "completed",
+              str(lb3._assignment_stage({"status": "approved"})))
+        check("running 算派发中",
+              lb3._assignment_stage({"status": "running"}) == "dispatched")
+
+        # ── 状态文件原子写：临时文件名唯一 ──
+        _src3 = (pathlib.Path(__file__).resolve().parent / "lark_bridge.py").read_text(encoding="utf-8")
+        check("状态临时文件名带 pid/随机后缀（并发写不再撞名）",
+              "tmp = STATE_FILE.with_name(f\"{STATE_FILE.name}.tmp.{os.getpid()}" in _src3)
+        check("状态锁可重入（同线程再拿不会自锁）",
+              "_LOCK_OWNER == me" in _src3)
+
+        # ── 投递与表情分线程 + 1 秒 tick ──
+        check("投递与表情是两个独立线程",
+              "def deliver_loop" in _src3 and "def reaction_loop" in _src3
+              and "threading.Thread(target=reaction_loop" in _src3)
+        check("投递循环 1 秒一 tick", "time.sleep(1)" in _src3)
+
+        # ── 回执 updated_at 由系统盖章 ──
+        _src4 = (pathlib.Path(__file__).resolve().parent / "worker_runner.py").read_text(encoding="utf-8")
+        check("回执 updated_at 被系统改写（不信 worker 自填）",
+              "updated_at\\s*[:：]" in _src4 and "resp_path.write_text(stamped" in _src4)
+
+        # ── router 契约：先派单后叙述 + 同批合并 + 后续指派带标识 ──
+        _rs = (pathlib.Path(__file__).resolve().parent / "skill" / "router-system.md").read_text(encoding="utf-8")
+        check("契约里有「先派单，后叙述」", "### 先派单，后叙述" in _rs)
+        check("契约里有同批合并回报规则", "### 同批指派：结果合并成一条回报" in _rs)
+        check("契约要求后续指派带具体标识", "### 后续指派要带具体标识" in _rs)
+        check("SKILL.md 由契约生成（单一真源）",
+              "### 先派单，后叙述" in (pathlib.Path(__file__).resolve().parent / "skill" / "SKILL.md").read_text(encoding="utf-8"))
 
         print("\n[26h] 事件带说话人/渠道/话题 + 链式派工上限 + worker prompt 内联")
         import router as rt4

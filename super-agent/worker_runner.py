@@ -251,6 +251,13 @@ def run_one(task_id: str, a: dict) -> None:
         summary = f"worker 进程退出码 {rc}：{(err or out)[-260:]}"
 
     body = resp_path.read_text(encoding="utf-8") if resp_path.exists() else ""
+    # updated_at 由系统**盖章** —— worker 自己填的时间戳不可信
+    # （实测出现过“比现在还晚 14 分钟”的编造时间，router 读到的就是它）。
+    stamped = re.sub(r"^([ \t]*(?:[-*]\s*)?updated_at\s*[:：]).*$",
+                     lambda mo: f"{mo.group(1)} {now()}", body, flags=re.M)
+    if stamped != body:
+        resp_path.write_text(stamped, encoding="utf-8")
+        body = stamped
     if ask:
         # 提问类回执：把「结论」段当成问题提给用户
         m = re.search(r"##\s*结论\s*\n+(.+?)(?:\n##|\Z)", body, re.S)

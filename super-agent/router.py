@@ -159,6 +159,27 @@ def build_prompt(ev: dict) -> str:
     if task:
         lines.append(f"任务: {task}" + (f" / {asg}" if asg else ""))
         lines.append(f"目录: {sa.task_dir(task)}")
+    if kind in ("assignment.completed", "assignment.failed") and task and asg:
+        # 本批兄弟指派：同一句用户消息派出去的其它活。
+        # router 用它判断「还有几条在跑」——
+        #   还有在跑的 → 这次只复核放行，回报等齐了统一发（系统会合并成一条）；
+        #   全部结束 → 一次性复核并回报。
+        try:
+            st = sa.load_state(task)
+            me = next((x for x in st.get("assignments") or [] if x["id"] == asg), None)
+            bid = (me or {}).get("batch_id") or ""
+            if bid:
+                b = sa.batch_status(bid)
+                if b.get("total", 0) > 1:
+                    lines.append(f"本批（{bid}）共 {b['total']} 条指派，还在飞 {b['in_flight']} 条")
+                    for r in b.get("assignments") or []:
+                        extra = ""
+                        if r.get("artifacts"):
+                            extra = " · 产出 " + ", ".join(str(x) for x in r["artifacts"][:2])
+                        lines.append(f"  · {r['task']}/{r['assignment']} · {r['status']}{extra}")
+                    lines.append("→ 还有在跑的：本轮只放行不回话，等本批全部结束再统一回报")
+        except (Exception, SystemExit) as e:
+            log(f"查本批兄弟指派失败：{str(e)[:120]}")
     return "\n".join(lines)
 
 

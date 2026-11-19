@@ -755,6 +755,48 @@ def collect_session_sources() -> list[dict]:
     return out
 
 
+# ── 批次：同一条用户消息派出去的多条指派 ───────────────────────────
+# 批次 id = 触发这批指派的那条用户消息 id（origin message_id）。
+# 用途：同批的指派**复核结果合并成一条回报**（而不是每个指派一条群消息）。
+BATCH_IN_FLIGHT = ("assigned", "running", "done", "rework")
+# 这些状态不再「在飞」：等人工回答/被阻塞时，不该把兄弟指派的结果一直压着不发
+# （用户得先看到结果，才知道该回答什么）
+
+
+def batch_status(batch_id: str) -> dict:
+    """一批指派的当前状态。
+
+    返回 {batch, total, in_flight, complete, assignments:[...]}：
+      · total     —— 这批一共几条指派
+      · in_flight —— 还在跑/待复核的条数
+      · complete  —— 没有在飞的了（可以统一回报）
+    """
+    rows: list[dict] = []
+    if batch_id:
+        for d in sorted(TASKS_DIR.glob("T*")):
+            sp = d / STATE_FILE
+            if not sp.exists():
+                continue
+            try:
+                st = json.loads(sp.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            for a in st.get("assignments") or []:
+                if (a.get("batch_id") or "") != batch_id:
+                    continue
+                rows.append({
+                    "task": st.get("task_id"), "assignment": a.get("id"),
+                    "worker": a.get("worker"), "status": a.get("status"),
+                    "review": a.get("review"),
+                    "artifacts": a.get("artifacts") or [],
+                    "response": a.get("response"),
+                    "completed_at": a.get("completed_at"),
+                })
+    inflight = [r for r in rows if r.get("status") in BATCH_IN_FLIGHT]
+    return {"batch": batch_id, "total": len(rows), "in_flight": len(inflight),
+            "complete": bool(rows) and not inflight, "assignments": rows}
+
+
 def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
     """Task Center 执行引擎：校验 Decision 并落地。
 
@@ -835,6 +877,21 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
                         f"（{it.get('agentId')} / {it.get('goal','')[:40]}）。"
                         f"要继续请等用户新消息，或到看板上调高链式派工上限。")
             good = []
+
+    # ── 本轮的「批次」：同一条用户消息派出去的多条指派 = 同一批 ──
+    # 批次 id 取触发本轮的那条用户消息；链式派工轮没有用户消息来源时，
+    # 继承被复核指派的批次（否则后续指派会被算成新的一批，回报又散开）。
+    _round_ref = _ref_dict(ROUND_SOURCE_REF)
+    round_batch = (_round_ref.get("message_id") or "").strip()
+    if not round_batch:
+        for rv in (doc.get("reviews") or []):
+            _aid = (rv.get("assignment") or "").strip()
+            _asg = next((x for x in state["assignments"] if x["id"] == _aid), None)
+            if _asg and (_asg.get("batch_id") or "").strip():
+                round_batch = (_asg.get("batch_id") or "").strip()
+                break
+    if not round_batch:
+        round_batch = (trig or "").strip()
 
     # ── reviews：确认 / 打回 worker 结果 ──
     # 注意：末尾会重新 load_state 再保存（因为 items 可能往同一任务追加指派），
@@ -959,6 +1016,8 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
             "pending_ack": False, "review": None,
             "worker_session_id": session_id,
             "inherits_session_from": sfrom or None,
+            # 批次 id（同一条用户消息派出的多条指派 = 同一批 → 结果合并回报）
+            "batch_id": round_batch or None,
             # 触发这次工作的那条用户消息 —— 桥接把表情（收到/派发/完成）
             # 挂在它上面，形成一条完整的进度轨迹
             "origin_ref": _ref_dict(ROUND_SOURCE_REF),
@@ -1004,6 +1063,9 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
             assignment=ob.get("assignment", ""),
             channel="feishu", chat_id=sess["chat_id"],
             message_id=sess["reply_to"], sender=sess["sender"],
+            # 结果类消息挂上批次 → 桥接把同批的结果**合并成一条**再发，
+            # 不再一条指派一条群消息。受理回执/提问/派单回话不挂批次（要立刻发）。
+            batch=(round_batch if (ob.get("purpose") or "") == "result" else ""),
             actor=actor)
         result["applied"].append({"kind": "outbox", "id": rec["id"],
                                    "purpose": rec["purpose"],
@@ -1129,6 +1191,15 @@ def cmd_submit_decision(a: argparse.Namespace) -> None:
 
 def cmd_outbox_list(a: argparse.Namespace) -> None:
     print(json.dumps(core.list_outbox(a.status or ""), ensure_ascii=False, indent=2))
+
+
+def cmd_batch(a: argparse.Namespace) -> None:
+    """查一批指派的进度（批次 id = 触发它的那条用户消息 id）。
+
+    router 复核前用它判断：「本批还有指派在跑吗」——
+    还有在跑的说明回报要等齐（结果消息会被系统合并成一条）。
+    """
+    print(json.dumps(batch_status(a.batch_id), ensure_ascii=False, indent=2))
 
 
 def cmd_outbox_add(a: argparse.Namespace) -> None:
@@ -1539,6 +1610,10 @@ def main() -> None:
     p = sub.add_parser("outbox-list")
     p.add_argument("--status", default="")
     p.set_defaults(func=cmd_outbox_list)
+
+    p = sub.add_parser("batch", help="查一批指派的进度（批次=触发它的那条用户消息 id）")
+    p.add_argument("batch_id")
+    p.set_defaults(func=cmd_batch)
 
     p = sub.add_parser("outbox-add")
     p.add_argument("--target", default="thread")

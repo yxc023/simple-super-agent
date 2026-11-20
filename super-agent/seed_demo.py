@@ -4,7 +4,7 @@
     python3 super-agent/seed_demo.py            # 灌演示数据
     python3 super-agent/seed_demo.py --clear    # 清空所有任务
 
-演示数据走的是与真实运行完全相同的协议（同样的 state.json / channels 文件），
+演示数据走的是与真实运行完全相同的协议（同样的 state.json / assignments 文件），
 所以在看板上的每一个按钮都能真实生效。清空用 --clear。
 """
 
@@ -45,9 +45,7 @@ def write_task(**kw) -> str:
     d = sa.task_dir(task_id)
     (d / "context").mkdir(parents=True, exist_ok=True)
     (d / "notes").mkdir(parents=True, exist_ok=True)
-    for sub in ("instructions", "responses", "notes"):
-        (sa.CHANNELS_DIR / task_id / sub).mkdir(parents=True, exist_ok=True)
-
+    (d / "assignments").mkdir(parents=True, exist_ok=True)
     ctx = []
     for i, (name, body) in enumerate(kw.get("context", []), start=1):
         p = d / "context" / f"{i:02d}-{name}"
@@ -73,9 +71,9 @@ def write_task(**kw) -> str:
 
 def write_asg(task_id: str, aid: str, worker: str, brief: str, instruction: str, **kw) -> None:
     state = sa.load_state(task_id)
-    instr = sa.CHANNELS_DIR / task_id / "instructions" / f"{aid}.md"
+    instr = sa.instruction_path(task_id, aid, create=True)
     instr.write_text(instruction, encoding="utf-8")
-    resp = sa.CHANNELS_DIR / task_id / "responses" / f"{aid}.md"
+    resp = sa.response_path(task_id, aid, create=True)
     resp.write_text(
         f"# 回执 {aid}\n\n- assignment: `{aid}`\n- worker: `{worker}`\n"
         f"- status: `pending`\n- updated_at: {kw.get('at', sa.now())}\n\n## 结论\n\n（待 worker 填写）\n",
@@ -138,10 +136,10 @@ def seed() -> None:
 
 ## 边界
 - 只读，不要触发任何写接口。
-- 不要修改 channels/ 与 tasks/ 之外的业务文件。
+- 不要修改 tasks/ 之外的业务文件。
 
 ## 回执要求
-写到 /abs/channels/T001/responses/A01.md，包含 status / 结论 / 产出绝对路径。
+写到 /abs/tasks/T001/assignments/A01/response.md，包含 status / 结论 / 产出绝对路径。
 """,
         at="2026-11-17T09:13:00+08:00",
     )
@@ -170,7 +168,7 @@ def seed() -> None:
 - 不要替 super agent 做汇总。
 
 ## 回执要求
-写到 /abs/channels/T001/responses/A02.md，包含 status / 结论 / 产出绝对路径。
+写到 /abs/tasks/T001/assignments/A02/response.md，包含 status / 结论 / 产出绝对路径。
 """,
         at="2026-11-17T14:05:00+08:00",
     )
@@ -209,7 +207,7 @@ def seed() -> None:
 - 只读，不要修改代码。
 
 ## 回执要求
-写到 /abs/channels/T002/responses/A01.md。
+写到 /abs/tasks/T002/assignments/A01/response.md。
 """,
         at="2026-11-17T11:32:00+08:00",
     )
@@ -224,7 +222,7 @@ def seed() -> None:
 - 只出方案，不改代码。
 
 ## 回执要求
-写到 /abs/channels/T002/responses/A02.md。
+写到 /abs/tasks/T002/assignments/A02/response.md。
 """,
         at="2026-11-17T13:20:00+08:00",
     )
@@ -252,7 +250,7 @@ def seed() -> None:
 3. 发布到 https://blog.example.com/news/2026/11/17/ 并回执线上链接。
 
 ## 回执要求
-写到 /abs/channels/T003/responses/A01.md，必须包含线上 URL。
+写到 /abs/tasks/T003/assignments/A01/response.md，必须包含线上 URL。
 """,
         at="2026-11-17T07:02:00+08:00",
     )

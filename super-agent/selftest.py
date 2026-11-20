@@ -28,6 +28,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 import core  # noqa: E402
 import sa  # noqa: E402
+import worker_runner  # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -45,11 +46,13 @@ def main() -> None:
     os.environ["SA_POLICY_FILE"] = str(_pol)
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sa-selftest-"))
     orig_tasks, orig_channels = sa.TASKS_DIR, sa.CHANNELS_DIR
+    orig_legacy_channels = sa.LEGACY_CHANNELS_DIR
     orig_core_outbox = core.OUTBOX_DIR
     orig_core_tasks = core.TASKS_DIR
     orig_router_dir, orig_router_inbox = sa.ROUTER_DIR, sa.ROUTER_INBOX
     sa.TASKS_DIR = tmp / "tasks"
     sa.CHANNELS_DIR = tmp / "channels"
+    sa.LEGACY_CHANNELS_DIR = sa.CHANNELS_DIR
     core.OUTBOX_DIR = tmp / "outbox"
     # 关键：自检事件不能写进真实 router 收件箱，否则会把常驻 router session 唤醒，
     # 让它处理一个只存在于临时沙箱里的 task（曾导致 triggerId 指向不存在的任务）。
@@ -98,12 +101,10 @@ def main() -> None:
             "items": [
                 {"triggerId": "trig-1", "taskAction": "continue", "taskId": tid,
                  "agentId": "general-purpose", "goal": "写 /tmp/x.md",
-                 "requirements": ["只写这一个文件"], "acceptance": ["文件存在"],
                  "confidence": 0.9, "reason": "实现", "rationale": "简单"},
                 {"triggerId": "trig-1", "taskAction": "continue", "taskId": tid,
                  "agentId": "不存在", "goal": "这条应该被单独拒绝",
-                 "requirements": [], "acceptance": [], "confidence": 0.1,
-                 "reason": "坏", "rationale": "坏"},
+                 "confidence": 0.1, "reason": "坏", "rationale": "坏"},
             ],
             "reviews": [],
             "outbox": [{"target": "thread", "purpose": "ack", "text": "已受理"}],
@@ -116,8 +117,11 @@ def main() -> None:
               len(st["assignments"]) == 1 and
               pathlib.Path(st["assignments"][0]["instruction"]).exists())
         instr = pathlib.Path(st["assignments"][0]["instruction"]).read_text(encoding="utf-8")
-        check("指令单由模板渲染（含回执要求与验收标准）",
-              "## 回执要求" in instr and "## 验收标准" in instr)
+        check("指令单由模板渲染（含回执要求）",
+              "## 回执要求" in instr)
+        check("指令单没有「具体要求 / 验收标准」小节（做法交给 worker）",
+              "## 具体要求" not in instr and "## 验收标准" not in instr, instr[:200])
+        check("指令单带用户目标", "写 /tmp/x.md" in instr)
 
         print("\n[4] approve 必须有产出证据")
         res2 = sa.apply_decision(tid, {
@@ -960,7 +964,8 @@ def main() -> None:
         check("user.message prompt 只带事件+triggerId+原话",
               pr.strip().splitlines()[0].startswith("[事件]")
               and "triggerId: trig-x" in pr
-              and pr.strip().splitlines()[-1] == "帮我写个文件", pr)
+              and "帮我写个文件" in pr
+              and "原话" in pr, pr)
         check("prompt 里没有最近轮次摘要", "最近几轮" not in pr and "digest" not in pr.lower())
         check("prompt 里没有重复的规格说明",
               "判断：" not in pr and "tasks-list" not in pr)
@@ -989,6 +994,64 @@ def main() -> None:
         check("session 名带启动时间", "Super Agent Router {" in src6)
         check("有历史会话名回填命令", "def cmd_rename_sessions" in src6)
         check("回填命令按文件名时间戳推本地时间", "rename-sessions" in src6)
+
+        print("\n[26f2] router session id 唯一化（super-agent-router-<创建时间>）")
+        import re as _re
+        import router as _router
+        # 状态文件指到沙箱，别碰生产 router/session_id.json
+        _router.ROUTER_DIR = sa.ROUTER_DIR
+        _router.SESSION_ID_FILE = sa.ROUTER_DIR / "session_id.json"
+        check("session id 前缀常量存在", 'SESSION_ID_PREFIX = "super-agent-router"' in src6)
+        check("id 带创建时间戳", "def make_session_id" in src6
+              and 'SESSION_ID_PREFIX}-{stamp}' in src6)
+        check("有持久化的 session 状态文件", 'SESSION_ID_FILE = ROUTER_DIR / "session_id.json"' in src6)
+        check("状态先落盘再归档（崩了也不会指向已归档的 id）",
+              src6.index("save_session_state({\n        \"session_id\": new_sid")
+              < src6.index("shutil.move(str(f), str(arch / f.name))"))
+        check("轮转会换新 id", "make_session_id(created)" in src6)
+        check("新 id 格式正确", bool(_re.fullmatch(
+            r"super-agent-router-\d{8}-\d{6}(-\d{2})?",
+            _router.make_session_id("2026-11-20T17:12:00+08:00"))),
+            _router.make_session_id("2026-11-20T17:12:00+08:00"))
+        # 同秒内连着造两个 id 不能撞（pi 按 id 反查，撞了会复现错的那个会话）
+        _sid_a = _router.make_session_id("2026-11-20T17:12:00+08:00")
+        _router.save_session_state({"session_id": _sid_a, "created_at": "2026-11-20T17:12:00+08:00"})
+        _sid_b = _router.make_session_id("2026-11-20T17:12:00+08:00")
+        check("同秒内连造两个 id 不撞", _sid_a != _sid_b, f"{_sid_a} vs {_sid_b}")
+        _router.save_session_state({"session_id": "super-agent-router-test",
+                                    "created_at": "2026-11-20T17:12:00+08:00"})
+        _st = _router.current_session_state()
+        check("状态文件读回当前 id", _st.get("session_id") == "super-agent-router-test")
+        check("状态文件带创建时间与显示名",
+              bool(_st.get("created_at")) and str(_st.get("name")).startswith("Super Agent Router "))
+        cv = (pathlib.Path(__file__).resolve().parent / "chain_view.py").read_text(encoding="utf-8")
+        check("看板找 router 会话时排除归档目录", '"archive" not in p.parts' in cv)
+        check("看板不再用旧的后缀匹配认会话", '"_super-agent-router.jsonl"' not in cv)
+
+        print("\n[26f3] Decision 只带目标：做法归 worker")
+        rs = (pathlib.Path(__file__).resolve().parent / "skill" / "router-system.md").read_text(encoding="utf-8")
+        check("契约里不再出现 requirements 字段", "requirements" not in rs)
+        check("契约里不再出现 acceptance 字段", "acceptance" not in rs)
+        check("契约说清派工描述只有 goal", "只有 `goal`" in rs or "只有 goal" in rs)
+        check("契约不再教具体业务怎么做",
+              all(w not in rs for w in ("早读", "早报", "T1 ", "T2 ", "T3 ", "ROLE.md")))
+        check("契约保留 worker 职责范围的选择规则", "职责范围" in rs)
+        check("契约指明名册在系统提示里", "名册" in rs and "registry.json" in rs)
+        _wb = _router.render_worker_brief()
+        _reg = json.loads((pathlib.Path(__file__).resolve().parent / "registry.json").read_text(encoding="utf-8"))
+        _enabled = [w["agent_id"] for w in _reg.get("workers") or [] if w.get("enabled")]
+        check("名册列出全部在册 worker",
+              all(f"`{a}`" in _wb for a in _enabled), _wb[:200])
+        check("名册写明只带目标不带做法", "不带做法" in _wb)
+        check("名册带触发闸门信息", "触发闸门" in _wb)
+        check("名册标注已停用 worker", "已停用" in _wb)
+        check("名册只讲职责范围，不讲做法",
+              not any(w in _wb for w in ("ROLE.md", "先读", "自动同意", "Markdown",
+                                        "窗口", "T1", "T2", "T3")))
+        src7b = (pathlib.Path(__file__).resolve().parent / "router.py").read_text(encoding="utf-8")
+        check("router 启动时把名册注入 system prompt",
+              "write_worker_brief()" in src7b
+              and src7b.count('"--append-system-prompt"') >= 2)
 
         print("\n[26g] 看板可读性优化")
         web = (pathlib.Path(__file__).resolve().parent / "web" / "index.html").read_text(encoding="utf-8")
@@ -1605,7 +1668,206 @@ def main() -> None:
               all(v["level"] == "WARN" for v in inv.run().violations
                   if v["rule"] == "assignment_transitions_legal"))
 
-        print("\n[27] 滞留进程巡检：连生产状态的验证脚本可被发现/清理")
+        print("\n[27] 指派单的两副面孔：新 session 完整 / 延续 session 精简")
+        # 交互模式（system prompt）存在且说清了两个输出通道
+        ipath = boot2 / "prompts" / "INTERACTION.md"
+        itxt = ipath.read_text(encoding="utf-8") if ipath.is_file() else ""
+        check("交互模式文件存在（框架补，router 不生成）", bool(itxt))
+        check("交互模式说清只有两个输出通道",
+              "产出文件" in itxt and "回执文件" in itxt)
+        check("交互模式说清 status 语义",
+              all(k in itxt for k in ("done", "failed", "blocked", "waiting_user_input")))
+
+        kw = dict(task_id="T900", assignment_id="A01", agent_id="explore",
+                  goal="统计任务数",
+                  context_files=[], background="背景说明", trigger_id="tr1",
+                  readonly=True, response_path="/tmp/x/response.md")
+        full_i = core.render_instruction(**kw)
+        cont_i = core.render_instruction(**kw, mode="continue")
+        check("新 session 指派单含完整契约（边界/回执格式/完成策略）",
+              all(s in full_i for s in ("## 边界（不要做这些）", "## 回执要求",
+                                        "## 完成策略", "## 背景")), full_i[:120])
+        check("新 session 指派单含完整回执格式骨架",
+              "```markdown" in full_i and "## 产出" in full_i)
+        check("延续 session 指派单标明是延续轮", "延续指派" in cont_i)
+        check("延续 session 指派单裁掉背景/边界/完成策略",
+              all(s not in cont_i for s in ("## 背景", "## 边界（不要做这些）", "## 完成策略")),
+              cont_i[:200])
+        check("延续 session 指派单保留目标",
+              "## 目标" in cont_i)
+        check("指派单不再有「具体要求 / 验收标准」小节（做法归 worker）",
+              all(s not in full_i for s in ("## 具体要求", "## 验收标准"))
+              and all(s not in cont_i for s in ("## 具体要求", "## 验收标准")))
+        check("延续 session 指派单仍写清回执路径与 status 枚举",
+              "/tmp/x/response.md" in cont_i and "waiting_user_input" in cont_i)
+        check("延续版比完整版短", len(cont_i) < len(full_i),
+              f"{len(cont_i)} vs {len(full_i)}")
+
+        # session 存在性判定：看事实（会话文件），不看意图
+        orig_sdir = sa.SESSION_DIR
+        fake_sdir = tmp / "sessions_probe"
+        (fake_sdir / "cwd-slug").mkdir(parents=True, exist_ok=True)
+        (fake_sdir / "cwd-slug" / "2026-01-01T00-00-00_w-T900-A01-explore-abcd12.jsonl").write_text(
+            "{}\n", encoding="utf-8")
+        sa.SESSION_DIR = fake_sdir
+        check("会话文件存在 → 判定为已有 session（可精简）",
+              sa.session_exists("w-T900-A01-explore-abcd12") is True)
+        check("会话文件不存在 → 判定为新 session（不能精简）",
+              sa.session_exists("w-T900-A02-explore-ffff99") is False)
+        check("非法 session id 不误判（防路径穿越）",
+              sa.session_exists("../../etc/passwd") is False and sa.session_exists("") is False)
+        sa.SESSION_DIR = orig_sdir
+
+        # 延续轮 prompt：短、不内联指派单全文
+        asg_cont = {"id": "A02", "worker": "explore",
+                    "instruction": str(tmp / "T900" / "assignments" / "A02" / "instruction.md"),
+                    "response": str(tmp / "T900" / "assignments" / "A02" / "response.md"),
+                    "worker_session_id": "w-T900-A01-explore-abcd12"}
+        (tmp / "T900" / "assignments" / "A02").mkdir(parents=True, exist_ok=True)
+        (tmp / "T900" / "assignments" / "A02" / "instruction.md").write_text(
+            cont_i, encoding="utf-8")
+        sa.SESSION_DIR = fake_sdir
+        p_cont, is_cont = worker_runner.build_prompt("T900", asg_cont)
+        sa.SESSION_DIR = orig_sdir
+        check("延续轮 prompt 不内联指派单全文", "```markdown" not in p_cont, p_cont[:160])
+        check("延续轮 prompt 仍给回执路径与摘要要求",
+              "response.md" in p_cont and "SUMMARY:" in p_cont)
+        check("延续轮 prompt 标注为延续", "继续上一个 session" in p_cont)
+
+        print("\n[28] 重复执行防护 + 分层产出（摘要/代投回话）")
+        # ── 摘要解析 ──
+        receipt = """# 回执 A01
+
+- assignment: `A01`
+- status: `done`
+
+## 摘要
+
+产出：/tmp/xxx.md
+已回话：否
+问题：无
+补充一句：只读统计完成。
+
+## 结论
+
+做完了。
+
+## 产出
+
+- `/tmp/xxx.md`
+
+## 回话
+
+统计完成：任务 84 个、指派 113 条。
+"""
+        ps = sa.parse_summary(receipt)
+        check("摘要段解析出产出", ps["produced"] == "/tmp/xxx.md", str(ps))
+        check("摘要段解析出「已回话：否」", ps["replied"] is False, str(ps))
+        check("摘要段解析出问题字段", ps["problem"] == "无", str(ps))
+        check("摘要有自由文本", "只读统计完成" in ps["text"], ps["text"])
+        check("回话段能取到", sa.receipt_section(receipt, "回话").startswith("统计完成"))
+        check("没有摘要段时返回空（不报错）", sa.parse_summary("# 回执\n\n## 结论\n\nx")["text"] == "")
+        long_sum = "## 摘要\n\n" + ("很长的摘要内容" * 200)
+        check("超长摘要被截断",
+              len(sa.parse_summary(long_sum)["text"]) <= sa.SUMMARY_MAX_CHARS + 12,
+              str(len(sa.parse_summary(long_sum)["text"])))
+        # ── 重复执行防护 ──
+        check("进程存活判定：假 pid 不算活", worker_runner.pid_alive(999999) is False)
+        check("worker 进程判定：假 pid 不算 worker", worker_runner.pid_is_worker(999999) is False)
+        check("回执是否已出结果：pending 不算",
+              worker_runner.receipt_has_result("- status: `pending`") is False)
+        check("回执是否已出结果：done 算",
+              worker_runner.receipt_has_result("- status: `done`") is True)
+
+        # ── runner 独占锁：两个 runner 不能同时跑 ──
+        import fcntl as _fcntl
+        lock_path = tmp / "runner.lock"
+        lfd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        _fcntl.flock(lfd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        lfd2 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        locked = False
+        try:
+            _fcntl.flock(lfd2, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            locked = True
+        except OSError:
+            locked = False
+        os.close(lfd2)
+        os.close(lfd)
+        check("第二个 runner 拿不到锁（防重复派工）", locked is False)
+
+        print("\n[28b] router 不拆解需求 + 框架自动复核（router 不读产出）")
+        # ── 用户原话进指派单 ──
+        iu = core.render_instruction(
+            task_id="T901", assignment_id="A01", agent_id="explore",
+            goal="用户的原话",
+            context_files=[], background="", trigger_id="tr", readonly=True,
+            response_path="/tmp/x/response.md",
+            user_text="帮我把 2024 年的报销单都核一遍", user_text_note="")
+        check("指派单含「## 用户原话」小节", "## 用户原话" in iu)
+        check("用户原话原文进指派单", "帮我把 2024 年的报销单都核一遍" in iu)
+        check("原话小节写明「不要改写」", "不要改写" in iu)
+
+        # ── Decision 里残留 requirements/acceptance → 不进指派单（做法归 worker）──
+        tid4 = sa.cmd_new_task(_ap.Namespace(
+            id=None, title="残留要求任务", goal="唯一目标-残留要求-4c2d", context=None,
+            context_file=None, acceptance="", source="manual", source_ref=None,
+            by="human", allow_new_task=False))
+        sa.apply_decision(tid4, {
+            "schemaVersion": 2, "triggerId": "trig-leftover",
+            "items": [{"triggerId": "trig-leftover", "taskAction": "continue", "taskId": tid4,
+                       "agentId": "general-purpose", "goal": "把事情办完",
+                       "requirements": ["必须先看 README 再改代码"],
+                       "acceptance": ["产出里要有三段"], "confidence": 0.8,
+                       "reason": "实现", "rationale": "r"}],
+            "reviews": [], "outbox": []}, actor="router")
+        st4 = sa.load_state(tid4)
+        instr4 = pathlib.Path(st4["assignments"][0]["instruction"]).read_text(encoding="utf-8")
+        check("Decision 里的 requirements 不进指派单",
+              "必须先看 README 再改代码" not in instr4, instr4[:200])
+        check("Decision 里的 acceptance 不进指派单",
+              "产出里要有三段" not in instr4, instr4[:200])
+        check("指派单只有目标，没有做法小节",
+              "把事情办完" in instr4 and "## 具体要求" not in instr4
+              and "## 验收标准" not in instr4)
+
+        # ── 框架机械复核：done + 产出存在 + 回执完整 → 自动放行 ──
+        tid3 = sa.cmd_new_task(_ap.Namespace(
+            id=None, title="自动复核任务", goal="唯一目标-自动复核-9b7c", context=None, context_file=None,
+            acceptance="", source="manual", source_ref=None, by="human", allow_new_task=False))
+        (tmp / "instr3.md").write_text("# 指派单\n\n干活\n", encoding="utf-8")
+        sa.cmd_assign(_ap.Namespace(task=tid3, worker="explore",
+                                    instruction_file=str(tmp / "instr3.md"), brief="b"))
+        aid3 = sa.load_state(tid3)["assignments"][0]["id"]
+        art3 = tmp / "art3.md"
+        art3.write_text("产出内容\n", encoding="utf-8")
+        sa.cmd_respond(_ap.Namespace(assignment=f"{tid3}/{aid3}", status="done",
+                                     summary="做完了", artifact=[str(art3)]))
+        a3 = sa.load_state(tid3)["assignments"][0]
+        check("框架自动放行（status=approved）", a3["status"] == "approved", a3["status"])
+        check("放行来源标为 framework", a3.get("review_by") == "framework", str(a3.get("review_by")))
+        check("任务直接完成（router 不参与）", sa.load_state(tid3)["status"] == "completed",
+              sa.load_state(tid3)["status"])
+        evs3 = [e for e in sa.read_events(tid3) if e.get("kind") == "assignment_auto_approved"]
+        check("有「框架自动放行」事件", len(evs3) == 1, str(evs3[:1]))
+
+        # ── 证据不足 → 不自动放行，交给 router ──
+        tid4 = sa.cmd_new_task(_ap.Namespace(
+            id=None, title="证据不足任务", goal="唯一目标-证据不足-4f2a", context=None, context_file=None,
+            acceptance="", source="manual", source_ref=None, by="human", allow_new_task=False))
+        (tmp / "instr4.md").write_text("# 指派单\n\n干活\n", encoding="utf-8")
+        sa.cmd_assign(_ap.Namespace(task=tid4, worker="explore",
+                                    instruction_file=str(tmp / "instr4.md"), brief="b"))
+        aid4 = sa.load_state(tid4)["assignments"][0]["id"]
+        sa.cmd_respond(_ap.Namespace(assignment=f"{tid4}/{aid4}", status="done",
+                                     summary="说完成了", artifact=[str(tmp / "不存在.md")]))
+        a4 = sa.load_state(tid4)["assignments"][0]
+        check("产出不存在 → 不自动放行", a4["status"] == "done", a4["status"])
+        check("未放行 → 任务挂 needs_human", sa.load_state(tid4)["status"] == "needs_human",
+              sa.load_state(tid4)["status"])
+        evs4 = [e for e in sa.read_events(tid4) if e.get("kind") == "assignment_review_pending"]
+        check("有「机械复核未通过」事件", len(evs4) == 1, str(evs4[:1]))
+
+        print("\n[29] 滞留进程巡检：连生产状态的验证脚本可被发现/清理")
         import time as _time
         import stale_sandbox as ss
         probe_dir = tmp / "stale_probe"
@@ -1679,6 +1941,7 @@ def main() -> None:
                     pass
     finally:
         sa.TASKS_DIR, sa.CHANNELS_DIR = orig_tasks, orig_channels
+        sa.LEGACY_CHANNELS_DIR = orig_legacy_channels
         core.OUTBOX_DIR = orig_core_outbox
         core.TASKS_DIR = orig_core_tasks
         sa.ROUTER_DIR, sa.ROUTER_INBOX = orig_router_dir, orig_router_inbox

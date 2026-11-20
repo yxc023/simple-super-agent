@@ -20,9 +20,10 @@ router / worker / 看板 / CLI 读写的是同一批文件。
 | 任务状态（唯一事实源） | `tasks/<id>/state.json` | Task Center |
 | 任务时间线 | `tasks/<id>/events.jsonl` | 全链路追加 |
 | 上下文包 | `tasks/<id>/context/` | Task Center 拷给 worker |
-| 指派单 | `channels/<id>/instructions/A0x.md` | Task Center |
-| 回执 | `channels/<id>/responses/A0x.md` | worker 写回 |
-| 人工干预 | `channels/<id>/notes/` | 人 / 看板 |
+| 指派单 | `tasks/<id>/assignments/<aid>/instruction.md` | Task Center |
+| 回执 | `tasks/<id>/assignments/<aid>/response.md` | worker 写回 |
+| 指派级人工干预 | `tasks/<id>/assignments/<aid>/notes.md` | 人 / 看板 |
+| 任务级人工干预 | `tasks/<id>/notes/TASK.md` | 人 / 看板 |
 | 外发消息队列 | `outbox/ob_*.json` | Task Center 建、投递器发 |
 | Worker 名册 | `registry.json` | 人 / 看板 |
 | router 收件箱 / 决策 | `router/inbox.jsonl`、`router/decisions/` | router |
@@ -36,6 +37,7 @@ router / worker / 看板 / CLI 读写的是同一批文件。
 super-agent/
 ├── README.md              ← 本文件：协议说明
 ├── sa.py                  ← 协议工具（建任务 / 派指派 / 收回执 / 查看）
+├── migrate_layout.py      ← 布局迁移（channels/ → tasks/<id>/assignments/，已执行过一次）
 ├── templates/
 │   ├── INSTRUCTION.md     ← 指派单模板（派给 worker 的东西）
 │   └── CONTEXT.md         ← 上下文包模板
@@ -55,23 +57,160 @@ super-agent/
 │       ├── task.md        ← 任务定义（目标、上下文、验收标准）
 │       ├── state.json     ← 机器可读状态（唯一事实源）
 │       ├── context/       ← 上下文文件副本（worker 只读这里）
-│       └── notes/         ← super agent 的过程笔记
-└── channels/
-    └── T001/
-        ├── instructions/  ← 指令渠道：每次指派一份 A01.md
-        ├── responses/     ← 回执渠道：worker 写回 A01.md
-        └── notes/         ← 人工干预记录：A01.md / TASK.md
+│       ├── notes/         ← 任务级人工批注（TASK.md）
+│       └── assignments/   ← 每次指派一个自包含目录
+│           └── A01/
+│               ├── instruction.md  ← 指令单（派给 worker 的东西）
+│               ├── response.md     ← 回执（worker 写回）
+│               └── notes.md        ← 该指派的人工批注
 ```
 
 任务目录下还有 `events.jsonl`（事件流，看板时间线的数据源）。
+
+> 2026-11-20 布局调整：原先的 `channels/<id>/{instructions,responses,notes}/` 已并入
+> `tasks/<id>/assignments/<aid>/`，一个指派一个自包含目录；任务级批注统一放
+> `tasks/<id>/notes/TASK.md`。迁移已完成（`migrate_layout.py`），**`channels/` 目录已删除**；
+> 代码里保留的旧路径读取只是兜底（目录不在，不会命中）。
+
+### 为什么叫 assignments 而不是 channels
+
+旧结构里 `channels/<id>/instructions/A01.md` + `responses/A01.md` 说的是**一条通道的两头**，
+但文件本身是**按指派（A01/A02）**组织的，任务级的东西（批注、产物）混在同一个 `notes/` 里，
+「指派级」和「任务级」分不开。新布局直接按指派切：
+
+| | 旧 | 新 |
+| --- | --- | --- |
+| 指派级 | `channels/<id>/instructions/A01.md`、`responses/A01.md`、`notes/A01.md` | `tasks/<id>/assignments/A01/{instruction,response,notes}.md` |
+| 任务级 | `channels/<id>/notes/TASK.md`（混在指派批注里） | `tasks/<id>/notes/TASK.md` |
+| 产物 | `channels/<id>/output/` | `tasks/<id>/output/` |
+
+好处：① 指派目录自包含，删一个指派就是删一个目录；② 指派级/任务级批注不再混放；
+③ 任务与指派不可能再「孤儿」（两个顶层目录靠约定对齐 → 一个目录树天然对齐）。
+
+**兼容**：代码里读旧路径时都会先找新路径，新路径不存在而旧路径还在 → 继续用旧的
+（`sa.instruction_path()` / `sa.response_path()` / `sa.notes_path()` 都走这个规则），
+所以未迁移的老任务不会因为一次改版就断链。
+
+**迁移**：
+
+```bash
+python3 super-agent/migrate_layout.py            # 演练（默认）
+python3 super-agent/migrate_layout.py --apply    # 真迁移（幂等）
+```
+
+迁移做三件事：搬文件、改写 `state.json` 里 `instruction`/`response` 的路径指针、
+改写 `task.md` 里的路径引用；不删数据（搬不空的旧目录会保留）。
+
+### 指派单的两副面孔（新 session / 延续 session）
+
+同一个 worker session 里，第一轮和后续轮拿到的**上下文不一样**：
+
+| | 新 session（会话文件不存在） | 延续 session（会话文件已存在） |
+| --- | --- | --- |
+| **交互模式**（你是谁、两个输出通道、status 语义、纪律） | `prompts/INTERACTION.md` → `pi --append-system-prompt` | 同左（**每次运行都注入**） |
+| **指派单** `instruction.md` | 完整版：目标 / 背景 / 要求 / 验收 / **边界** / **回执格式** / 完成策略 | 精简版：目标 / 要求 / 验收 / 回执路径（格式「与上一轮一致」） |
+| **送进 pi 的 prompt** | 内联指派单全文 + 回执路径 + SUMMARY 要求 | 只给：延续说明 + 目标摘要 + 指派单路径 + 回执路径 + SUMMARY 要求 |
+
+三条规则：
+
+1. **判定看事实，不看意图** —— 「是不是已有 session」看
+   `~/.pi/agent/sessions/*/*{worker_session_id}.jsonl` 在不在，不看 Decision 里有没有
+   `sessionFrom`。`sessionFrom` 指向的会话若还没跑过（文件不存在），它实际就是新 session，
+   必须给完整契约，不能精简。
+2. **交互模式由框架补，router 不生成** —— `prompts/INTERACTION.md` 是唯一真源，
+   框架每次启动 worker 时用 `--append-system-prompt` 注入。
+   *为什么每次都注入*：pi 的 system prompt **不写进会话历史**（实测 session 文件里
+   `role=system` 消息为空），只在本轮生效。延续轮若不补，worker 手里只剩历史里的间接痕迹。
+3. **通用纪律不进指派单** —— 「不要替 router 对外发消息」「缺信息不要猜」「敏感信息不出现在
+   产出里」等由 system prompt 统一承担；指派单的「边界」只留**任务相关**的两条
+   （不改任务目录外的文件、只读角色不改业务文件）。
+
+### 分层产出：摘要（给 router）+ 回话（框架代投）
+
+worker 的回执多两段，框架据此把「读全文」变成「读摘要」，并允许 worker 自己把话给用户：
+
+```
+## 摘要                    ← worker 自报，≤300 字（SA_SUMMARY_MAX_CHARS）
+产出：/abs/path/产物.md
+已回话：否
+问题：无
+
+## 回话                    ← 可选：给用户看的话，框架**直接投递**
+（你要对用户说的话，直接写这里）
+```
+
+| 机制 | 做什么 |
+| --- | --- |
+| **摘要** | 三行固定字段（产出 / 已回话 / 问题）+ 自由文本。框架解析后写进 `state.json` 与 `assignment.completed` 事件 → **router 默认只看摘要**，不用打开产出文件 |
+| **问题** | 摘要里 `问题：` 不是「无」时，事件里会高亮提醒 router 关注 |
+| **回话** | 框架直接建 outbox 记录（`purpose=worker_result`）投递 —— **不用 router 再转述一遍**。也可以写在**产出文件末尾**的 `## 回话` / `## 给用户看的话` 小节里 |
+| **不重复** | worker 已回话（`已回话：是`）→ 框架不再自动投递；router 仍写了 `result` → 框架把它 **suppressed**（用户只收到一条） |
+
+标题认别名（`回话` / `给用户看的话` / `给用户的话` / …），模板占位文字不会被当成真话投出去。
+
+### 重复执行防护（assignment 不会被跑两遍）
+
+runner 每次派工会把 worker 进程的 **pid** 记进 `state.json`：
+
+| 情况 | 处理 |
+| --- | --- |
+| worker 进程**还活着** | **不收回、不重派** —— 复用前一次执行，等它跑完，由**接管逻辑**登记回执（事件 `assignment_reused`） |
+| worker 进程**已死**、回执也没写 | 真僵死 → 收回成 `assigned` 重派（事件 `assignment_reclaimed`） |
+| 没有 pid 信息（旧数据） | 超过 `SA_WORKER_TIMEOUT` 才算僵死，否则当作还在跑 |
+| 接管时回执**已经写好** | 直接登记（**不重跑**），产出与摘要照常解析 |
+| 两个 runner 同时跑 | pid 文件 **flock 独占锁** —— 第二个直接退出（防重复派工） |
+
+### router 只做三件事：派给谁 / 新建还是延续 / 把用户话带到
+
+**router 不做需求分析，也不做目标拆解。** 用户的话由框架原样带进指派单：
+
+```
+## 用户原话
+
+（这是用户本人的话，**不要改写、不要替用户重新定义需求**；怎么做、怎么验收由你决定）
+
+帮我统计一下 super-agent/tasks 下有多少个任务还在 needs_human 状态，把清单写到 /tmp/x.md，回我一句结论就行。
+```
+
+- 框架从本轮事件取**用户原话**（`router/round.json` 的 `text`），放进指派单；
+  链式派工轮没有新用户消息时，用**本任务最初的原话**（存在 `state.json` 的 `user_request`）；
+- Decision 里**只有 `goal`** 一个派工描述字段：写用户原话或忠实转述。
+  **没有 `requirements`、没有 `acceptance`** —— 怎么做、拆几步、交付成什么样、怎么验收，
+  是 **worker 自己**的判断（框架不渲染这两段，Decision 里写了也到不了 worker）。
+
+### 完成判定：框架机械复核，router 不读产出
+
+worker 回执结构化之后，**完成没完成不需要 router 判断**：
+
+| 条件 | 结果 |
+| --- | --- |
+| `status=done` + 产出文件**真实存在** + 回执含「## 摘要」或「## 结论」 | 框架**直接放行**（`review_by=framework`，事件 `assignment_auto_approved`），任务直接 completed |
+| 产出缺失 / 回执不完整 | 不放行，事件 `assignment_review_pending` 说清原因 → **只有这时** router 才需要介入（补证据 / 打回 / 问人） |
+
+所以 `assignment.completed` 事件里 router 拿到的是：
+「**框架已自动放行**（产出 N 个文件均存在、回执结构完整）」+ 摘要 + 产出路径，
+并附一句「**不用为此去读 response.md / task.md / 产出物**」。
+
+### 单一真相源
+
+| 文件 | 是什么 | 能不能手改 |
+| --- | --- | --- |
+| `tasks/<id>/state.json` | **唯一事实源**：状态、指派登记、路径指针 | 不要手改（走 `sa.py`） |
+| `tasks/<id>/task.md` | `state.json` 的人读投影，每次保存自动重渲染 | 不要手改 |
+| `tasks/<id>/events.jsonl` | 只追加的时间线（谁在何时做了什么） | 不改 |
+| `tasks/<id>/assignments/<aid>/instruction.md` | 派给 worker 的原文（可能被追加人工要求） | 由 Task Center 写 |
+| `tasks/<id>/assignments/<aid>/response.md` | worker 写的回执原文；**头部 status 是 worker 的自述** | worker 写 |
+
+所以：**登记状态看 `state.json`**，不要从回执文件头的 `status` 反推；
+`sa.py respond` 会把登记结果追加到回执末尾的 `[sa.py 登记]` 段，两者对不上时以
+`state.json` 为准。
 
 ## 核心概念
 
 | 概念 | 含义 | 载体 |
 | --- | --- | --- |
 | **Task（任务）** | 一次完整的指令受理，含目标、上下文、验收标准 | `tasks/T001/task.md` + `state.json` |
-| **Assignment（指派）** | 一次「把活派给某个 worker」的动作 | `channels/T001/instructions/A01.md` |
-| **Channel（渠道）** | 指令下行 + 回执上行的两条文件通道 | `instructions/` 与 `responses/` |
+| **Assignment（指派）** | 一次「把活派给某个 worker」的动作 | `tasks/T001/assignments/A01/`（指令单 + 回执 + 批注） |
 | **Context（上下文）** | worker 执行所需的背景材料 | `tasks/T001/context/` |
 
 一次 Task 可以有多个 Assignment；同一个 Task 下的多个 Assignment 可以并行跑。
@@ -113,12 +252,12 @@ python3 super-agent/sa.py new-task \
   --acceptance "表格含 编号/标题/状态/负责人/来源链接 四列，按状态分组"
 ```
 
-产出 `tasks/T001/`（task.md、state.json、context/ 副本）与 `channels/T001/` 空目录。
+产出 `tasks/T001/`（task.md、state.json、context/ 副本、notes/、assignments/）。
 
 ### 2. 派指派（写指令单 → assign）
 
 先按 `templates/INSTRUCTION.md` 写一份指令单（可以是临时文件），
-再让工具把它落到指令渠道并登记状态：
+再让工具把它落到指派目录并登记状态：
 
 ```bash
 python3 super-agent/sa.py assign \
@@ -129,8 +268,8 @@ python3 super-agent/sa.py assign \
 ```
 
 工具会：
-- 复制指令单到 `channels/T001/instructions/A01.md`
-- 建回执骨架 `channels/T001/responses/A01.md`
+- 复制指令单到 `tasks/T001/assignments/A01/instruction.md`
+- 建回执骨架 `tasks/T001/assignments/A01/response.md`
 - 在 `state.json` 里登记 `A01`，状态置 `assigned`
 
 ### 3. 收回执
@@ -154,7 +293,7 @@ python3 super-agent/sa.py show --task T001
 
 ## Worker 回执约定
 
-worker 必须把回执写进 `channels/T001/responses/A01.md`，至少包含：
+worker 必须把回执写进 `tasks/T001/assignments/A01/response.md`，至少包含：
 
 - `status`：`done` / `failed` / `blocked`
 - **结论**：一句话说清做了什么、结果是什么（不是过程复述）
@@ -180,10 +319,10 @@ worker（Pi subagent）只需要知道两件事：
 ```
 你现在是 general-purpose worker。
 
-请先完整读取指派单：<abs>/channels/T001/instructions/A01.md
+请先完整读取指派单：<abs>/tasks/T001/assignments/A01/instruction.md
 严格按指派单里的「具体要求」「边界」执行，只做这一件事。
 
-完成后把回执写到：<abs>/channels/T001/responses/A01.md
+完成后把回执写到：<abs>/tasks/T001/assignments/A01/response.md
 回执格式见指派单末尾「回执要求」（status / 结论 / 产出绝对路径）。
 ```
 
@@ -209,7 +348,7 @@ python3 super-agent/seed_demo.py            # 灌入
 python3 super-agent/seed_demo.py --clear    # 清空全部任务
 ```
 
-演示数据走的是与真实运行**完全相同的协议**（同样的 `state.json` / `channels/` 文件），
+演示数据走的是与真实运行**完全相同的协议**（同样的 `state.json` / `assignments/` 文件），
 所以页面上的每一个按钮在演示数据上都能真实生效。
 
 ### 页面能力
@@ -439,7 +578,7 @@ python3 super-agent/trace.py T764
 | `inbox/messages.jsonl`、`inbox/handled.jsonl` | 消息元信息 + 永久账本（去重凭据） |
 | `router/inbox.jsonl`、`router/outbox.jsonl`、`router/decisions/<id>.json` | 投给 router 的事件、router 的判断与回话、决策原文 |
 | `tasks/T*/events.jsonl` | 任务时间线（带 actor 归因：router / worker-runner / worker / outbox） |
-| `channels/T*/instructions|responses/*` | 派工指令与 worker 回执 |
+| `tasks/T*/assignments/*/{instruction,response,notes}.md` | 派工指令与 worker 回执 |
 | `outbox/ob_*.json` | 外发记录（凭据 message_id） |
 | `~/.pi/agent/sessions/**` | worker / router 的**原始会话**（模型思考与工具调用全文） |
 
@@ -590,6 +729,21 @@ system prompt 里，历史与用户主动 @ 的那些消息在 session 里。事
 `router/digest.md` 仍然逐轮落盘，但**只作记录**（看板/排障用），不再注入 prompt。
 手动 `rotate` 之后 session 会丢一段上下文，router 用 `sa.py tasks-list` 自行重建现状。
 
+### Worker 名册：每个新 session 启动时从 registry 生成
+
+router 的 system prompt 由**两段**组成（都用 `--append-system-prompt` 注入）：
+
+| 段 | 来源 | 内容 |
+| --- | --- | --- |
+| 操作契约 | `skill/router-system.md`（手写，唯一真源） | 边界、事件→动作、Decision 格式、复核、outbox、硬规则 |
+| Worker 名册 | **`registry.json` 自动生成**（`router/worker_brief.md`） | 每个 worker 是谁、只读与否、职责范围、触发闸门、已停用的 |
+
+名册**每个新 session 启动时重新生成**（`router.py` 启动时写文件再注入），
+所以 registry 改了，下次开 session 就生效；暂时不设运行中的热更新机制。
+
+名册只讲**职责范围**，不讲具体业务怎么做 —— 怎么做是 worker 自己角色规格
+（`role_prompt` / `ROLE.md`）的事，router 不复述、不替它设计步骤。
+
 ### 派发事件不再唤醒 router
 
 `assignment.dispatched` 是 router 自己的动作 —— 投递它只会让 router 被自己的回声唤醒，
@@ -602,8 +756,10 @@ router 会被唤醒的事件：`task.created` / `assignment.completed` / `assign
 super-agent/router.py start|stop|status|run|tail
 ```
 
-- **一个常驻 pi 进程 = 一个常驻 session**（`--session-id super-agent-router`），
+- **一个常驻 pi 进程 = 一个常驻 session**（`--session-id super-agent-router-<创建时间>`），
   所有飞书指令、worker 回执、人工干预都进这**同一个 session**，所以 router 对上下文有记忆。
+  session id 记在 `router/session_id.json`：重启 → 读同一个 id → pi 复现同一会话（上下文不丢）；
+  轮转 → 换一个新 id → pi 开新会话（老会话进 `archive/`）。
 - 事件通过 `router/inbox.jsonl` 投递，router tail 它；处理结果写入 `router/outbox.jsonl`。
 - **prompt 只带事件类型 + id + 文件路径，不重复携带上下文** —— 上下文在 session 里。
 
@@ -680,13 +836,17 @@ Task Center（sa.py = 唯一写入口）
   "triggerId": "<本轮 triggerId>",
   "items": [
     {"triggerId": "…", "taskAction": "create|continue", "taskId": "",
-     "agentId": "general-purpose", "goal": "…", "requirements": ["…"],
-     "acceptance": ["…"], "confidence": 0.9, "reason": "…", "rationale": "…"}
+     "agentId": "general-purpose", "goal": "…",
+     "confidence": 0.9, "reason": "…", "rationale": "…"}
   ],
   "reviews": [{"assignment": "A01", "verdict": "approve|reject", "note": "…"}],
   "outbox": [{"target": "thread|actor", "purpose": "ack|reply|question|result|notify", "text": "…"}]
 }
 ```
+
+> 派工描述**只有 `goal`**：没有「具体要求」「验收标准」。怎么做、交付成什么样、怎么验收
+> 全部交给 worker（它有自己的角色规格）。`requirements` / `acceptance` 即使写了
+> 也不会进指派单。
 
 规则：
 
@@ -791,6 +951,10 @@ router 用**一个统一的长驻 session**（`super-agent-router`），所有�
 - **手动轮转**：`python3 super-agent/router.py rotate` —— 归档当前 session 文件、
   重启 router 开一个干净的；跨轮次连续性由 `super-agent/router/digest.md` 承接
   （每轮追加一行摘要，同时作为「最近状态」锚点随事件一起给 router）。
+- **轮转 = 换 session id**：新 id 是 `super-agent-router-<创建时间>`，老 id 的会话文件进
+  `archive/`。id 必须唯一 —— pi 复现会话靠 id 反查（`SessionManager.findById`），
+  顶层一旦有**两份同 id** 的文件，它会挑任意一份 resume，router 就会带着上一代的上下文跑。
+  当前 id 以 `router/session_id.json` 为准（重启靠它续接，轮转时换新）。
 - 每轮事件消息里带最近 8 行摘要，帮助在长上下文里定位「刚才那个」指什么。
 
 「别去处理历史遗留任务」靠**工具护栏 + 契约**约束，不靠切断上下文。
@@ -1127,6 +1291,7 @@ triggerId: a2f7837a3528
 - **Router Session** —— 「轮转 Session」按钮：归档当前会话、重开一个干净的。
   会话文件进 `~/.pi/agent/sessions/.../archive/`，上下文丢一段，
   router 用 `sa.py tasks-list` 自行重建现状。
+  轮转会同时把 session id 换成 `super-agent-router-<新创建时间>`（见下）。
 
 对应 API：
 
@@ -1136,13 +1301,23 @@ curl -X POST localhost:8788/api/router/model -d '{"restore":true}'
 curl -X POST localhost:8788/api/router/rotate -d '{}'
 ```
 
-## Router Session 命名
+## Router Session 命名与 id
 
 会话 display name 带**开启时间**：`Super Agent Router 2026-11-18 15:35:02`。
 
 `pi --resume` 的会话选择器渲染的是 `session.name`，所以历次 router session 在列表里
 一眼能分清是哪一次开的（早期创建的都叫同一个名字，可用
 `router.py rename-sessions` 按文件名时间戳回填）。
+
+**session id** 则是 `super-agent-router-<创建时间>`（如 `super-agent-router-20261120-165446`），
+当前 id 存在 `router/session_id.json`：
+
+| 场景 | id | 上下文 |
+| --- | --- | --- |
+| router 重启 | 不变 | 续接（pi 按 id 复现同一个会话文件） |
+| 手动轮转 | 换新的 | 清零（老会话文件进 `archive/`） |
+
+id 必须唯一：pi 复现会话是按 id 反查的，顶层有**两份同 id** 文件时它会挑任意一份 resume。
 
 ```bash
 python3 super-agent/router.py rename-sessions   # 回填历史会话名

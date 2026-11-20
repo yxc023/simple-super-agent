@@ -27,10 +27,13 @@ tasks/T875/
 ├── task.md        # 任务定义（目标、上下文、验收标准）
 ├── state.json     # 机器可读状态（唯一事实源）
 ├── events.jsonl   # 事件流（谁在什么时候做了什么）
-└── context/       # 上下文文件副本（worker 只读这里）
-channels/T875/
-├── instructions/A01.md   # 指派单（派给 worker 的东西）
-└── responses/A01.md      # 回执（worker 写回）
+├── context/       # 上下文文件副本（worker 只读这里）
+├── notes/         # 任务级人工批注（TASK.md）
+└── assignments/
+    └── A01/
+        ├── instruction.md   # 指派单（派给 worker 的东西）
+        ├── response.md      # 回执（worker 写回）
+        └── notes.md         # 该指派的人工批注
 ```
 
 因此：
@@ -40,7 +43,7 @@ channels/T875/
 | router | pi 扩展 `router_gate.ts` 直接掐掉能力：bash 只能调 Task Center，read 只能读任务目录，write 只能写 /tmp；**查代码、跑脚本、调外部系统一律拒绝** |
 | worker | `registry.json` 是名册唯一真源：是否在册、是否启用、是否只读、并发上限，派工前由 Task Center 校验；只读 worker 由机制强制，不靠 prompt 自觉 |
 | 触发闸门 | 某些 worker 带 `trigger_gate`（例如只允许 owner 私聊触发），由 Task Center 校验 Decision 里的 `requester`，闸门不符直接拒派 |
-| 状态 | 全部落文件（`tasks/` `channels/` `outbox/`），CLI、看板、agent 三方读写同一套文件 |
+| 状态 | 全部落文件（`tasks/` `outbox/`），CLI、看板、agent 三方读写同一套文件 |
 
 ### 为什么用文件存
 
@@ -108,7 +111,7 @@ python3 super-agent/lark_bridge.py reply --task T001 --text "结果…"
 
 ## 安全边界
 
-- **运行期状态不入库**：`tasks/` `channels/` `outbox/` `inbox/` `router/` 与飞书状态文件
+- **运行期状态不入库**：`tasks/` `outbox/` `inbox/` `router/` 与飞书状态文件
   都在 `.gitignore` 里 —— 它们记录真实任务与消息正文（含人名、open_id、群 id）。
 - **配置不入库**：`lark_config.json` / `policy.json` / `registry.json` 只提交
   `*.example.json` 模板。

@@ -28,7 +28,7 @@
 
 ## 边界（不要做这些）
 
-- 不要修改 `channels/` 以外的任何文件
+- 不要修改本任务目录（`tasks/<id>/`）以外的任何文件
 - 不要替 super agent 做汇总汇报，只做你的那一段
 - 遇到歧义不要猜：写 `status: blocked`，说明卡在什么、需要什么
 
@@ -37,7 +37,7 @@
 完成后把回执写到：
 
 ```
-/abs/path/to/channels/T001/responses/A01.md
+/abs/path/to/tasks/T001/assignments/A01/response.md
 ```
 
 格式：

@@ -13,7 +13,7 @@
     router/outbox.jsonl       router 的判断与回话
     router/decisions/<id>.json 单次决策原文
     tasks/T*/events.jsonl     任务时间线（actor 归因）
-    tasks/T*/channels/...     派工指令与 worker 回执
+    tasks/T*/assignments/...  派工指令与 worker 回执
     outbox/ob_*.json          外发记录
     ~/.pi/agent/sessions/     worker / router 的原始会话（模型思考过程）
 """
@@ -103,10 +103,18 @@ def collect(key: str) -> dict:
                     for p in list(t.glob("*.json")) + list(t.glob("*.md"))
                     + list((t / "context").glob("*")) if p.is_file()):
                 continue
+            adir = t / "assignments"
+            aids = sorted(p.name for p in adir.iterdir()
+                          if p.is_dir() and (p / "instruction.md").exists()) if adir.exists() else []
+            if not aids:
+                # 旧布局：channels/<tid>/{instructions,responses}/*.md
+                legacy = t.parent / "channels" / t.name
+                aids = sorted(p.stem for p in (legacy / "instructions").glob("*.md")) \
+                    if (legacy / "instructions").exists() else []
             out["tasks"][t.name] = {
                 "events": list(_jsonl(t / "events.jsonl")),
-                "instructions": [p.name for p in (t / "channels" / "instructions").glob("*")] if (t / "channels" / "instructions").exists() else [],
-                "responses": [p.name for p in (t / "channels" / "responses").glob("*")] if (t / "channels" / "responses").exists() else [],
+                "instructions": aids,
+                "responses": aids,
             }
     for p in (root / "outbox").glob("ob_*.json"):
         if key in p.read_text(encoding="utf-8", errors="replace"):

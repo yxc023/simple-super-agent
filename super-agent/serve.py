@@ -31,7 +31,7 @@ MAX_BODY = 2 * 1024 * 1024
 # `/api/file` 允许读取的一级子目录（相对 ROOT）。
 # 只放状态目录：配置文件（lark_config.json / policy.json）里有 app_id、open_id 等标识符，
 # 看板是无鉴权的本地服务，不应该把它们暴露出去。
-FILE_READABLE_DIRS = ("tasks", "channels", "outbox", "router")
+FILE_READABLE_DIRS = ("tasks", "outbox", "router")
 
 
 def read_text(path: str | None, limit: int = 60000) -> str:
@@ -266,7 +266,7 @@ def collect() -> dict:
             st = json.loads(sp.read_text(encoding="utf-8"))
             asgs = []
             for a in st.get("assignments", []):
-                notes = sa.notes_path(st["task_id"], a["id"])
+                notes = sa.notes_path(st["task_id"], a["id"], create=False)
                 asgs.append(
                     {
                         **a,
@@ -378,7 +378,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/file"):
                 # 只允许读 super-agent 目录内的**状态类**文件：
                 #   - 路径必须在 ROOT 内（用 is_relative_to，前缀字符串比较会被 ../ 绕过）
-                #   - 且必须落在状态目录白名单里（tasks/channels/outbox/router），
+                #   - 且必须落在状态目录白名单里（tasks/outbox/router），
                 #     否则 lark_config.json / policy.json 里的标识符会被无鉴权读走
                 q = urlparse(self.path).query
                 target = ""

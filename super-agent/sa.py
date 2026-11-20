@@ -74,7 +74,14 @@ SA_ROOT = env_path("SA_ROOT") or ROOT
 SANDBOX_MODE = SA_ROOT != ROOT
 
 TASKS_DIR = state_path("SA_TASKS_DIR", "tasks")
-CHANNELS_DIR = state_path("SA_CHANNELS_DIR", "channels")
+# ── 布局迁移（2026-11）：channels/ 已并入 tasks/ ──
+# 旧布局：channels/<task_id>/{instructions/<aid>.md, responses/<aid>.md, notes/<name>.md}
+# 新布局：tasks/<task_id>/assignments/<aid>/{instruction.md, response.md, notes.md}
+#         tasks/<task_id>/notes/TASK.md        （任务级人工批注）
+# 迁移后仍保留对旧路径的**读取兜底**：新文件不存在、旧文件还在 → 继续用旧的，
+# 这样未迁移的老任务不会因为一次改版就断链（见 _pick / instruction_path 等）。
+LEGACY_CHANNELS_DIR = state_path("SA_CHANNELS_DIR", "channels")
+CHANNELS_DIR = LEGACY_CHANNELS_DIR  # 旧名兼容（外部脚本可能引用）
 INBOX_DIR = state_path("SA_INBOX_DIR", "inbox")
 # 桥接的永久账本（正常路径下账本先于 router 事件写入，router 用它做反查）
 LEDGER_FILE = INBOX_DIR / "handled.jsonl"
@@ -100,11 +107,18 @@ def die(msg: str) -> None:
 # task id 会从飞书消息、HTTP 请求体等外部输入进来，必须先校验格式，
 # 否则 `TASKS_DIR / task_id` 会被 `../` 之类的片段带出状态根（路径穿越写）。
 TASK_ID_RE = re.compile(r"^T\d{3,}$")
+# 指派 id 同样是外部输入（router 决策、HTTP 请求体），必须校验后才能拼路径。
+ASSIGNMENT_ID_RE = re.compile(r"^A\d{2,}$")
 
 
 def valid_task_id(task_id: str) -> bool:
     """task id 是否是合法格式（T + 至少 3 位数字）。"""
     return bool(task_id) and bool(TASK_ID_RE.match(task_id))
+
+
+def valid_assignment_id(assignment_id: str) -> bool:
+    """指派 id 是否是合法格式（A + 至少 2 位数字）。"""
+    return bool(assignment_id) and bool(ASSIGNMENT_ID_RE.match(assignment_id))
 
 
 def task_dir(task_id: str) -> pathlib.Path:
@@ -163,12 +177,67 @@ def read_events(task_id: str) -> list:
     return out
 
 
-def notes_path(task_id: str, name: str) -> pathlib.Path:
+def assignment_dir(task_id: str, assignment_id: str, *, create: bool = False) -> pathlib.Path:
+    """指派目录（新布局）：`tasks/<task_id>/assignments/<assignment_id>/`。
+
+    每个指派一个自包含目录：指令单、回执、人工批注都在里面。
+    """
     if not valid_task_id(task_id):
         die(f"invalid task id: {task_id!r}（应为 T + 至少 3 位数字）")
-    p = CHANNELS_DIR / task_id / "notes"
-    p.mkdir(parents=True, exist_ok=True)
-    return p / f"{name}.md"
+    if not valid_assignment_id(assignment_id):
+        die(f"invalid assignment id: {assignment_id!r}（应为 A + 至少 2 位数字）")
+    d = task_dir(task_id) / "assignments" / assignment_id
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _pick(new: pathlib.Path, legacy: pathlib.Path) -> pathlib.Path:
+    """新路径优先；新路径不存在但旧路径还在 → 用旧的（兼容未迁移的老任务）。"""
+    if new.exists() or not legacy.exists():
+        return new
+    return legacy
+
+
+def instruction_path(task_id: str, assignment_id: str, *, create: bool = False) -> pathlib.Path:
+    """指派单路径：`tasks/<tid>/assignments/<aid>/instruction.md`（旧：channels/.../instructions/<aid>.md）。"""
+    new = assignment_dir(task_id, assignment_id, create=create) / "instruction.md"
+    return _pick(new, LEGACY_CHANNELS_DIR / task_id / "instructions" / f"{assignment_id}.md")
+
+
+def response_path(task_id: str, assignment_id: str, *, create: bool = False) -> pathlib.Path:
+    """回执路径：`tasks/<tid>/assignments/<aid>/response.md`（旧：channels/.../responses/<aid>.md）。"""
+    new = assignment_dir(task_id, assignment_id, create=create) / "response.md"
+    return _pick(new, LEGACY_CHANNELS_DIR / task_id / "responses" / f"{assignment_id}.md")
+
+
+def assignment_notes_path(task_id: str, assignment_id: str, *, create: bool = False) -> pathlib.Path:
+    """指派级人工批注：`tasks/<tid>/assignments/<aid>/notes.md`（旧：channels/.../notes/<aid>.md）。"""
+    new = assignment_dir(task_id, assignment_id, create=create) / "notes.md"
+    return _pick(new, LEGACY_CHANNELS_DIR / task_id / "notes" / f"{assignment_id}.md")
+
+
+def task_notes_path(task_id: str, *, create: bool = False) -> pathlib.Path:
+    """任务级人工批注：`tasks/<tid>/notes/TASK.md`（旧：channels/.../notes/TASK.md）。"""
+    new = task_dir(task_id) / "notes" / "TASK.md"
+    return _pick(new, LEGACY_CHANNELS_DIR / task_id / "notes" / "TASK.md")
+
+
+def notes_path(task_id: str, name: str, *, create: bool = True) -> pathlib.Path:
+    """人工批注文件路径。
+
+    name == "TASK" → 任务级批注 `tasks/<tid>/notes/TASK.md`；
+    否则 → 指派级批注 `tasks/<tid>/assignments/<aid>/notes.md`。
+    """
+    if not valid_task_id(task_id):
+        die(f"invalid task id: {task_id!r}（应为 T + 至少 3 位数字）")
+    if name == "TASK":
+        p = task_notes_path(task_id, create=create)
+    else:
+        p = assignment_notes_path(task_id, name, create=create)
+    if create:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def append_note(task_id: str, name: str, block: str) -> pathlib.Path:
@@ -179,10 +248,110 @@ def append_note(task_id: str, name: str, block: str) -> pathlib.Path:
     return p
 
 
+# ── 回执解析：摘要段 / 回话段 ──
+# 摘要限长（router 默认只读摘要，摘要太长就失去意义）
+SUMMARY_MAX_CHARS = int(os.environ.get("SA_SUMMARY_MAX_CHARS", "300"))
+# worker 代投给用户的回话限长
+REPLY_MAX_CHARS = int(os.environ.get("SA_REPLY_MAX_CHARS", "1000"))
+
+
+def receipt_section(text: str, title: str) -> str:
+    """取回执里某个 `## 标题` 小节的正文（到下一个 `## ` 为止）。"""
+    m = re.search(r"^##\s*" + re.escape(title) + r"\s*$(.*?)(?=^##\s|\Z)",
+                  text or "", re.M | re.S)
+    return m.group(1).strip() if m else ""
+
+
+# 「给用户看的话」的标题别名 —— worker 常自己改个说法，别因为标题对不上就丢内容
+REPLY_HEADINGS = ("回话", "给用户看的话", "给用户的话", "给用户的消息",
+                  "用户消息", "给用户")
+# 模板占位文字 —— worker 照抄模板没改内容时，不能把占位当成给用户的话投出去
+REPLY_PLACEHOLDERS = ("（可选）", "不写就不投递", "（待 worker 填写）",
+                      "这里写给用户", "给用户看的话 ——")
+
+
+def _is_placeholder(text: str) -> bool:
+    return any(p in (text or "") for p in REPLY_PLACEHOLDERS)
+
+
+def receipt_reply_section(text: str) -> str:
+    """取「给用户看的话」小节（认标题别名）。
+
+    按**文档顺序**取最后一个非空的小节 —— 回执里可能先有模板占位、后有真正内容。
+    """
+    if not text:
+        return ""
+    hits: list[tuple[int, str]] = []
+    for h in REPLY_HEADINGS:
+        for m in re.finditer(r"^##\s*" + re.escape(h) + r"\s*$(.*?)(?=^##\s|\Z)",
+                             text, re.M | re.S):
+            hits.append((m.start(), m.group(1)))
+    for _, sec in reversed(sorted(hits, key=lambda x: x[0])):
+        if sec.strip() and not _is_placeholder(sec):
+            return sec.strip()
+    return ""
+
+
+def reply_from_artifacts(paths: list) -> str:
+    """从产出文件里找「## 回话」小节（worker 也允许把给用户的话写在产出末尾）。
+
+    取**最后一个** `## 回话` 小节（报告结尾往往是给用户的那句）。
+    """
+    for p in (paths or []):
+        try:
+            txt = pathlib.Path(str(p)).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        sec = receipt_reply_section(txt)
+        if sec:
+            return sec
+    return ""
+
+
+def parse_summary(text: str) -> dict:
+    """解析回执的 `## 摘要` 段。
+
+    约定三行固定字段（缺失当未知）：
+        产出：/abs/path        → produced
+        已回话：是/否            → replied（True/False/None）
+        问题：无/具体描述        → problem
+    其余行作为自由文本。**全文限长** SUMMARY_MAX_CHARS。
+    """
+    raw = receipt_section(text or "", "摘要")
+    out = {"produced": "", "replied": None, "problem": "", "text": ""}
+    if not raw:
+        return out
+    free: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^(产出|已回话|问题)\s*[:：]\s*(.*)$", s)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if key == "产出":
+                out["produced"] = val
+            elif key == "已回话":
+                out["replied"] = True if val.startswith("是") else (
+                    False if val.startswith("否") else None)
+            else:
+                out["problem"] = val
+        else:
+            free.append(s)
+    body = raw.strip()
+    if len(body) > SUMMARY_MAX_CHARS:
+        body = body[:SUMMARY_MAX_CHARS].rstrip() + " …（已截断）"
+    out["text"] = body
+    out["free"] = " ".join(free)[:SUMMARY_MAX_CHARS]
+    return out
+
+
 def render_task_md(state: dict) -> str:
     asg = state.get("assignments", [])
     lines = [
         f"# {state['title']}",
+        "",
+        "> 本文由 `state.json` 投影生成，**请勿手改**；事实以 `state.json` 为准。",
         "",
         f"- task_id: `{state['task_id']}`",
         f"- created_at: {state['created_at']}",
@@ -384,7 +553,8 @@ def cmd_new_task(a: argparse.Namespace) -> None:
 def create_task_internal(*, title: str, goal: str, acceptance: str = "", source: str = "manual",
                          source_ref: list | None = None, context: list | None = None,
                          context_file: list | None = None, by: str = "human",
-                         task_id: str | None = None, notify_created: bool = True) -> str:
+                         task_id: str | None = None, notify_created: bool = True,
+                         user_request: str = "") -> str:
     """建任务的内部实现。
 
     CLI 入口 cmd_new_task 有护栏（router 不能直接建任务）；
@@ -429,10 +599,7 @@ def create_task_internal(*, title: str, goal: str, acceptance: str = "", source:
     d = task_dir(task_id)
     (d / "context").mkdir(parents=True, exist_ok=True)
     (d / "notes").mkdir(parents=True, exist_ok=True)
-    ch = CHANNELS_DIR / task_id / "instructions"
-    ch.mkdir(parents=True, exist_ok=True)
-    (CHANNELS_DIR / task_id / "responses").mkdir(parents=True, exist_ok=True)
-    (CHANNELS_DIR / task_id / "notes").mkdir(parents=True, exist_ok=True)
+    (d / "assignments").mkdir(parents=True, exist_ok=True)
 
     ctx_files = []
     for i, f in enumerate(context_file or [], start=1):
@@ -462,6 +629,8 @@ def create_task_internal(*, title: str, goal: str, acceptance: str = "", source:
         "acceptance_lines": [acceptance] if acceptance else [],
         "completion_policy": {"require_approval": True, "evidence_required": True},
         "task_notes": "",
+        # 用户原话（router 不拆解需求 —— 需求分析与拆解是 worker 的事）
+        "user_request": user_request or "",
         "assignments": [],
     }
     save_state(task_id, state)
@@ -505,14 +674,13 @@ def cmd_assign(a: argparse.Namespace) -> None:
     src = pathlib.Path(a.instruction_file).expanduser().resolve()
     if not src.is_file():
         die(f"instruction file not found: {a.instruction_file}")
-    instr_dst = CHANNELS_DIR / task_id / "instructions" / f"{aid}.md"
-    instr_dst.parent.mkdir(parents=True, exist_ok=True)
+    instr_dst = instruction_path(task_id, aid, create=True)
     body = src.read_text(encoding="utf-8")
     if a.brief:
         body = f"<!-- brief: {a.brief} -->\n\n" + body
     instr_dst.write_text(body, encoding="utf-8")
 
-    resp_dst = CHANNELS_DIR / task_id / "responses" / f"{aid}.md"
+    resp_dst = response_path(task_id, aid, create=True)
     resp_dst.write_text(
         f"# 回执 {aid}\n\n- assignment: `{aid}`\n- worker: `{a.worker}`\n"
         f"- status: `pending`\n- updated_at: {now()}\n\n## 结论\n\n（待 worker 填写）\n",
@@ -557,7 +725,10 @@ def cmd_respond(a: argparse.Namespace) -> None:
     state, asg = find_assignment(a.assignment, getattr(a, "task", None))
     task_id = state["task_id"]
 
-    resp_path = pathlib.Path(asg["response"])
+    resp_path = response_path(task_id, asg["id"], create=True)
+    # **先取 worker 原文**（在追加登记脚注之前）——
+    # 「## 回话」是给用户看的原话，不能混进系统脚注。
+    worker_body = resp_path.read_text(encoding="utf-8") if resp_path.exists() else ""
     footer = [
         "",
         "---",
@@ -638,11 +809,84 @@ def cmd_respond(a: argparse.Namespace) -> None:
             except Exception as e:
                 log_event(task_id, "actor_grant_failed", "worker-runner",
                           f"临时授权失败：{str(e)[:120]}", assignment=asg["id"])
+    # ── 回执解析：摘要（给 router 看）+ 回话（框架代投）──
+    summ = parse_summary(worker_body)
+    reply_text = receipt_reply_section(worker_body)
+    if not reply_text:
+        # 回执里没写「## 回话」→ 看产出文件里有没有（worker 也允许把它写在产出末尾）
+        reply_text = reply_from_artifacts(a.artifact or [])
+    if reply_text and len(reply_text) > REPLY_MAX_CHARS:
+        reply_text = reply_text[:REPLY_MAX_CHARS].rstrip() + " …（已截断）"
+    asg["summary"] = summ["text"]
+    asg["summary_fields"] = {"产出": summ["produced"], "已回话": summ["replied"],
+                              "问题": summ["problem"]}
+
+    # ── 代投：worker 在回执里写了「## 回话」→ 框架直接投给用户，router 不用再转述 ──
+    auto_replied = False
+    if reply_text and summ["replied"] is not True:
+        ref = round_source_ref() or (state.get("source_ref") or {})
+        sess = core.resolve_session(task_id,
+                                    chat_id=str(ref.get("chat_id") or ""),
+                                    message_id=str(ref.get("message_id") or ""),
+                                    thread_id=str(ref.get("thread_id") or ""),
+                                    root_id=str(ref.get("root_id") or ""))
+        rec = core.add_outbox(
+            target="thread", purpose="worker_result", text=reply_text,
+            task=task_id, assignment=asg["id"],
+            channel=str(ref.get("platform") or "") or core.task_source_ref(task_id).get("platform", "") or "feishu",
+            chat_id=sess.get("chat_id", ""), message_id=sess.get("reply_to", ""),
+            sender=sess.get("sender", ""), actor="worker")
+        auto_replied = True
+        asg["auto_replied"] = True
+        # 标记这个批次已由 worker 代投 → router 后续同批的 result 不再重复发
+        bid = asg.get("batch_id") or ""
+        if bid:
+            m = state.setdefault("auto_replied_batches", {})
+            m[bid] = {"at": now(), "assignment": asg["id"], "outbox_id": rec.get("id")}
+        log_event(task_id, "worker_replied", "worker",
+                  f"{asg['id']} 的回话已由框架代投（outbox {rec.get('id')}）",
+                  assignment=asg["id"], outbox_id=rec.get("id"))
+
+    # ── 框架机械复核：产出真实存在 + 回执结构完整 → 直接放行 ──
+    # router 不再需要为了「完成没完成」去读 response.md / 产出物；
+    # 只有机械核不过（产出缺失/回执不完整）时，才需要它介入。
+    auto_approved = False
+    review_note = ""
+    if status == "done":
+        arts = list(a.artifact or [])
+        missing = [p for p in arts if not pathlib.Path(str(p)).is_file()]
+        structured = bool(summ["text"]) or bool(receipt_section(worker_body, "结论"))
+        if arts and not missing and structured:
+            asg["status"] = "approved"
+            asg["review"] = "approved"
+            asg["review_by"] = "framework"
+            auto_approved = True
+            log_event(task_id, "assignment_auto_approved", "framework",
+                      f"{asg['id']} 机械复核通过（产出 {len(arts)} 个文件均存在，回执结构完整）→ 直接放行",
+                      assignment=asg["id"], artifacts=arts)
+        else:
+            why = []
+            if not arts:
+                why.append("没有产出证据")
+            elif missing:
+                why.append(f"产出文件不存在：{missing[0]}")
+            if not structured:
+                why.append("回执缺少「## 摘要」或「## 结论」")
+            review_note = "；".join(why)
+            log_event(task_id, "assignment_review_pending", "framework",
+                      f"{asg['id']} 机械复核未通过（{review_note}）→ 交 router 决定",
+                      assignment=asg["id"], reason=review_note)
+
     state["status"] = recompute_task_status(state)
     save_state(task_id, state)
     log_event(task_id, "responded", "worker", f"{asg['id']} 回执：{status}", assignment=asg["id"], status=status)
     notify("assignment.completed", task_id, assignment=asg["id"], status=status, worker=asg["worker"],
-           summary=a.summary, artifacts=a.artifact or [], response=str(resp_path))
+           summary=summ["text"] or a.summary,
+           summary_fields=asg["summary_fields"],
+           artifacts=a.artifact or [], response=str(resp_path),
+           auto_replied=auto_replied or None,
+           auto_approved=auto_approved or None,
+           review_note=review_note or None)
     print(json.dumps({"task": task_id, "assignment": asg["id"], "status": status, "task_status": state["status"]}, ensure_ascii=False))
 
 
@@ -680,8 +924,25 @@ def round_source_ref() -> dict:
     return {}
 
 
+def round_user_text() -> str:
+    """本轮用户**原话**（用户消息轮才有；其它轮为空）。
+
+    router 不该替用户做需求分析与目标拆解 —— 框架把原话原样带给 worker，
+    worker 自己判断怎么做、怎么验收。
+    """
+    rf = ROUTER_DIR / "round.json"
+    if rf.exists():
+        try:
+            rnd = json.loads(rf.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return ""
+        return str(rnd.get("text") or "").strip()
+    return ""
+
+
 # 每轮开始由 router 刷新（apply_decision 读它给 outbox 定位投递目标）
 ROUND_SOURCE_REF: dict = {}
+ROUND_USER_TEXT: str = ""
 
 
 # 指派结束类事件：这些轮次默认只做复核与回话
@@ -734,6 +995,33 @@ def _empty_state() -> dict:
 def new_worker_session_id(task_id: str, aid: str, agent: str) -> str:
     """生成 worker session id —— worker_runner 用它 `pi --print --session-id` 复现/延续会话。"""
     return f"w-{task_id}-{aid}-{agent}-{uuid.uuid4().hex[:6]}"
+
+
+# pi 的会话文件目录：~/.pi/agent/sessions/<cwd-slug>/<时间戳>_<session-id>.jsonl
+SESSION_DIR = pathlib.Path.home() / ".pi" / "agent" / "sessions"
+_SESSION_ID_OK = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def session_exists(session_id: str) -> bool:
+    """这个 worker session **是不是已经跑过**（= worker 还记得上一轮）。
+
+    判定看**事实**（会话文件在不在），不看意图：
+      · 在 → 延续轮：交互模式/边界/回执格式上一轮都说过了，可以只给增量；
+      · 不在 → 实际就是个新 session：必须给完整契约，不能精简。
+
+    session id 形如 `w-<task>-<aid>-<agent>-<rand>`，天然不会跳任务串号。
+    """
+    sid = (session_id or "").strip()
+    if not sid or not _SESSION_ID_OK.match(sid):
+        return False
+    if not SESSION_DIR.is_dir():
+        return False
+    try:
+        for _ in SESSION_DIR.glob(f"*/*{sid}.jsonl"):
+            return True
+    except OSError:
+        return False
+    return False
 
 
 def collect_session_sources() -> list[dict]:
@@ -807,8 +1095,9 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
     """
     # task_id 可以为空 —— 用户消息轮（user.message）没有既有任务上下文，
     # 此时 Decision 自己决定新建任务还是沿用某个已有任务。
-    global ROUND_SOURCE_REF
+    global ROUND_SOURCE_REF, ROUND_USER_TEXT
     ROUND_SOURCE_REF = round_source_ref()
+    ROUND_USER_TEXT = round_user_text()
     state = load_state(task_id) if task_id else _empty_state()
     # ── 幂等：同一 triggerId 重复提交时，reviews 不重复生效 ──
     trig = doc.get("triggerId")
@@ -933,7 +1222,7 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
             review_updates[aid] = {"status": "rework", "review": "rejected",
                                    "pending_ack": False}
             note = rv.get("note") or ""
-            instr = pathlib.Path(asg["instruction"])
+            instr = instruction_path(task_id, aid, create=True)
             with instr.open("a", encoding="utf-8") as f:
                 f.write(f"\n\n---\n\n## 复核意见（{now()}）\n\n{note}\n\n> 请按此意见重做，并重新写回执。\n")
             result["applied"].append({"kind": "review.reject", "assignment": aid, "note": note})
@@ -961,6 +1250,7 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
                     context=[],
                     context_file=[],
                     by=actor,
+                    user_request=ROUND_USER_TEXT,   # 用户原话存进任务（延续轮也要用）
                     notify_created=False,   # 不再发 task.created 事件（router 自己在处理）
                 )
             except Exception as e:
@@ -977,27 +1267,10 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
         n = len(tstate["assignments"]) + 1
         aid = f"A{n:02d}"
         spec = core.worker_spec(agent) or {}
-        resp = CHANNELS_DIR / target_task / "responses" / f"{aid}.md"
-        instr = CHANNELS_DIR / target_task / "instructions" / f"{aid}.md"
-        instr.parent.mkdir(parents=True, exist_ok=True)
-        resp.parent.mkdir(parents=True, exist_ok=True)
-        body = core.render_instruction(
-            task_id=target_task, assignment_id=aid, agent_id=agent,
-            goal=it.get("goal", ""),
-            requirements=list(it.get("requirements") or []),
-            acceptance=list(it.get("acceptance") or tstate.get("acceptance_lines") or []),
-            context_files=list(tstate.get("context_files") or []),
-            background=tstate.get("goal", ""),
-            trigger_id=it.get("triggerId", ""),
-            readonly=bool(spec.get("readonly")),
-            response_path=str(resp),
-        )
-        instr.write_text(body, encoding="utf-8")
-        resp.write_text(
-            f"# 回执 {aid}\n\n- assignment: `{aid}`\n- agent: `{agent}`\n"
-            f"- status: `pending`\n- updated_at: {now()}\n\n## 结论\n\n（待 worker 填写）\n",
-            encoding="utf-8")
+        resp = response_path(target_task, aid, create=True)
+        instr = instruction_path(target_task, aid, create=True)
         # worker session：sessionFrom 继承，否则新建一个
+        # —— 继承解析要**先于**渲染：要不要用精简版指派单，取决于这个 session 是否真的跑过。
         sfrom = (it.get("sessionFrom") or "").strip()
         inherited = ""
         if sfrom:
@@ -1007,6 +1280,34 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
             else:
                 _reject("session_not_ready", f"{target_task}/{sfrom} 还没有 worker session")
                 continue
+        # 判定「已有 session」：**看事实**（session 文件存不存在），不看意图。
+        # 文件在 → worker 记得上一轮 → 精简指派单 + 短 prompt；
+        # 文件不在 → 实际就是个新 session → 完整指派单（别把它精简没了）。
+        cont = bool(inherited) and session_exists(inherited)
+        # 用户原话：本轮有就用本轮的；没有（链式派工轮）就用本任务最初的原话
+        _utext = ROUND_USER_TEXT.strip()
+        _unote = ""
+        if not _utext:
+            _utext = str(tstate.get("user_request") or "").strip()
+            if _utext:
+                _unote = "本轮没有新的用户消息，下面是**本任务最初**的用户请求。"
+        body = core.render_instruction(
+            task_id=target_task, assignment_id=aid, agent_id=agent,
+            goal=it.get("goal", ""),
+            context_files=list(tstate.get("context_files") or []),
+            background=tstate.get("goal", ""),
+            trigger_id=it.get("triggerId", ""),
+            readonly=bool(spec.get("readonly")),
+            response_path=str(resp),
+            user_text=_utext,
+            user_text_note=_unote,
+            mode="continue" if cont else "full",
+        )
+        instr.write_text(body, encoding="utf-8")
+        resp.write_text(
+            f"# 回执 {aid}\n\n- assignment: `{aid}`\n- agent: `{agent}`\n"
+            f"- status: `pending`\n- updated_at: {now()}\n\n## 结论\n\n（待 worker 填写）\n",
+            encoding="utf-8")
         session_id = inherited or new_worker_session_id(target_task, aid, agent)
         tstate["assignments"].append({
             "id": aid, "worker": agent, "status": "assigned",
@@ -1073,6 +1374,15 @@ def apply_decision(task_id: str, doc: dict, actor: str = "router") -> dict:
             # 结构化 @ 提及（飞书的 @ 是消息内容里的实体，不是正文里的「@名字」）
             mentions=(ob.get("mentions") or []),
             actor=actor)
+        # worker 已经在回执里写了「## 回话」且框架代投了 → router 这条 result 不再重复发
+        _auto = (load_state(ob_task).get("auto_replied_batches") or {}) if ob_task else {}
+        if (ob.get("purpose") or "") == "result" and round_batch and round_batch in _auto:
+            core.update_outbox(rec, status="suppressed",
+                               attempts=rec.get("attempts", 0) + 1,
+                               note=f"worker 已直接回话（框架代投 {_auto[round_batch].get('outbox_id')}）"
+                                    "——不重复回报")
+            log_event(ob_task, "outbox_suppressed", "router",
+                      f"{rec['id']} 被抑制：worker 已直接回话", batch=round_batch)
         result["applied"].append({"kind": "outbox", "id": rec["id"],
                                    "purpose": rec["purpose"],
                                    "session_source": rec.get("session_source", "")})
@@ -1423,7 +1733,7 @@ def intervene(task_id: str, assignment_id: str | None, action: str, text: str = 
         append_note(task_id, assignment_id, block)
         log_event(task_id, "comment", who, f"{assignment_id} 人工批注", assignment=assignment_id, text=text)
         # 批注也要让正在跑的 worker 看得到
-        instr = pathlib.Path(asg["instruction"])
+        instr = instruction_path(task_id, assignment_id, create=True)
         with instr.open("a", encoding="utf-8") as f:
             f.write(f"\n\n---\n\n## 人工追加要求（{ts}）\n\n{text}\n")
     elif action == "approve":
@@ -1438,7 +1748,7 @@ def intervene(task_id: str, assignment_id: str | None, action: str, text: str = 
         asg["review"] = "rejected"
         asg["pending_ack"] = True
         append_note(task_id, assignment_id, f"## [{ts}] 人工打回\n\n{text}\n")
-        instr = pathlib.Path(asg["instruction"])
+        instr = instruction_path(task_id, assignment_id, create=True)
         with instr.open("a", encoding="utf-8") as f:
             f.write(f"\n\n---\n\n## 人工打回意见（{ts}）\n\n{text}\n\n> 请按此意见重做，并重新写回执。\n")
         log_event(task_id, "rejected", who, f"{assignment_id} 人工打回", assignment=assignment_id, text=text)
@@ -1462,7 +1772,7 @@ def intervene(task_id: str, assignment_id: str | None, action: str, text: str = 
         asg["dispatched_at"] = ts
         asg["completed_at"] = None
         append_note(task_id, assignment_id, f"## [{ts}] 人工改派：{old} → {to_worker}\n\n{text}\n")
-        instr = pathlib.Path(asg["instruction"])
+        instr = instruction_path(task_id, assignment_id, create=True)
         with instr.open("a", encoding="utf-8") as f:
             f.write(f"\n\n---\n\n## 人工改派（{ts}）：{old} → {to_worker}\n\n{text}\n")
         log_event(task_id, "redirected", who, f"{assignment_id} 改派 {old} → {to_worker}", assignment=assignment_id, to=to_worker, text=text)

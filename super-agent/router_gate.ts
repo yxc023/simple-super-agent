@@ -44,8 +44,7 @@ const SHELL_METACHARS = /[;&|`$()\n\r<>]/;
 
 /** router 可以读的任务相关目录 */
 const READ_ROOTS = [
-  path.join(SA, "tasks"),
-  path.join(SA, "channels"),
+  path.join(SA, "tasks"),        // 含 tasks/<id>/assignments/<aid>/{instruction,response,notes}.md
   path.join(SA, "router"),
   path.join(SA, "inbox"),
 ];
@@ -120,7 +119,7 @@ export default function (pi: ExtensionAPI) {
         return {
           block: true,
           reason:
-            "router 只读任务相关文件（tasks/ channels/ router/ inbox/ 与 /tmp 下的产出物）。\n" +
+            "router 只读任务相关文件（tasks/ router/ inbox/ 与 /tmp 下的产出物）。\n" +
             "读业务代码不是你的职责 —— 把这件事写进指派单，派 worker 去做。",
         };
       }

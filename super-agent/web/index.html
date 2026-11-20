@@ -838,7 +838,7 @@ function openAssign(){
   openModal('手动派单 · '+S.sel,
     `<label>worker</label><select id="fWorker">${(S.data.workers||[]).map(w=>`<option>${w}</option>`).join('')}</select>
      <label>一句话摘要</label><input id="fBrief" placeholder="例如：先摸清需求仓数据结构"/>
-     <label>指令单内容（Markdown）</label><textarea id="fText" style="min-height:200px" placeholder="# 指派单\n\n## 任务目标\n\n## 具体要求\n1. …\n\n## 回执要求\n写到 responses/&lt;id&gt;.md"></textarea>`,
+     <label>指令单内容（Markdown）</label><textarea id="fText" style="min-height:200px" placeholder="# 指派单\n\n## 任务目标\n\n## 具体要求\n1. …\n\n## 回执要求\n写到 tasks/&lt;task&gt;/assignments/&lt;id&gt;/response.md"></textarea>`,
     async (txt)=>{ await api('/api/assign',{task:S.sel,worker:document.getElementById('fWorker').value,
         brief:document.getElementById('fBrief').value,instruction:txt}); });
 }

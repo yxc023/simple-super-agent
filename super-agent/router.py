@@ -91,9 +91,21 @@ def save_model_state(st: dict) -> None:
     MODEL_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-SESSION_ID = "super-agent-router"
+# session id = 前缀 + 创建时间（如 super-agent-router-20261120-165446）。
+#
+# 为什么带时间戳：pi 复现会话靠 id 反查（SessionManager.findById），
+# 顶层一旦有**两份同 id** 的文件，pi 会挑其中任意一份 resume ——
+# 轮转后如果还沿用固定 id，老会话被捞回来，router 就又带着上一代的上下文跑。
+# 所以「开一个新会话」必须换一个**唯一** id；
+# 「重启续接同一会话」则靠持久化的 router/session_id.json 记着当前 id。
+SESSION_ID_PREFIX = "super-agent-router"
+# 当前 session 的持久化状态（id / 创建时间 / 显示名）—— 跨进程的唯一权威
+SESSION_ID_FILE = ROUTER_DIR / "session_id.json"
 # 操作契约放在 system prompt 里 —— 事件消息只留「哪个任务、哪个 trigger」，不重复携带规格
 SYSTEM_PROMPT_FILE = ROOT / "skill" / "router-system.md"
+# worker 名册：每个新 session 启动时从 registry.json 重新生成并注入 system prompt
+WORKER_BRIEF_FILE = ROUTER_DIR / "worker_brief.md"
+REGISTRY_FILE = ROOT / "registry.json"
 # 工具护栏：让 router 在机制上无法自己调查/执行
 GATE_FILE = ROOT / "router_gate.ts"
 PID_FILE = pathlib.Path("/tmp/super-agent-router.pid")
@@ -109,6 +121,241 @@ def log(msg: str) -> None:
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(line)
     print(msg, flush=True)
+
+
+# ────────────────────── session 身份（id / 创建时间 / 归档） ──────────────────────
+
+
+def session_display_name(created_at: str) -> str:
+    """会话显示名：Super Agent Router <创建时间>。
+
+    `pi --resume` 的选择器渲染的是 name，所以历次会话在列表里一眼能分清是哪一次开的。
+    """
+    try:
+        ts = _dt.datetime.fromisoformat(created_at).astimezone()
+        return f"Super Agent Router {ts.strftime('%Y-%m-%d %H:%M:%S')}"
+    except (ValueError, TypeError):
+        return f"Super Agent Router {created_at}"
+
+
+def router_session_dir() -> pathlib.Path:
+    """pi 为本仓库 cwd 建的会话目录（pi 用 cwd 反写目录名，不能写死本机路径）。"""
+    return pathlib.Path(os.path.expanduser(
+        "~/.pi/agent/sessions")) / ("--" + str(REPO).strip("/").replace("/", "-") + "--")
+
+
+def router_session_files() -> list[pathlib.Path]:
+    """本仓库 cwd 下**顶层**的 router session 文件（archive/ 下的不算，按新到旧排）。
+
+    只认顶层：归档是历史，不是「当前会话」—— 看板和轮转都不该把它们当现行。
+    """
+    d = router_session_dir()
+    if not d.exists():
+        return []
+    out = [p for p in d.iterdir()
+           if p.is_file() and p.suffix == ".jsonl" and SESSION_ID_PREFIX in p.name]
+    return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def session_header(path: pathlib.Path) -> dict:
+    """读 session 文件头（id / 创建时间都在头一行）。"""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            d = json.loads(f.readline())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def session_header_id(path: pathlib.Path) -> str:
+    """读 session 文件头里的 id。"""
+    return str(session_header(path).get("id") or "")
+
+
+def session_header_time(path: pathlib.Path) -> str:
+    """session 的创建时间（文件头里的 UTC 时间戳 → 本地时间）。"""
+    ts = str(session_header(path).get("timestamp") or "")
+    if not ts:
+        return ""
+    try:
+        return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().isoformat(timespec="seconds")
+    except ValueError:
+        return ""
+
+
+def session_file_for(sid: str) -> pathlib.Path | None:
+    """某个 id 对应的**顶层** session 文件（没有 = 还没开过）。"""
+    for p in router_session_files():
+        if p.name.endswith(f"_{sid}.jsonl"):
+            return p
+    return None
+
+
+def make_session_id(created_at: str | None = None) -> str:
+    """生成一个新的、唯一的 session id：super-agent-router-<创建时间>。
+
+    时间戳是本地时间（和显示名里的时间一致），秒级精度。
+    同一秒内连续创建两次会撞 id（pi 按 id 反查，撞了会复现错的那个）→ 顺延。
+    """
+    ts = created_at or now()
+    try:
+        stamp = _dt.datetime.fromisoformat(ts).astimezone().strftime("%Y%m%d-%H%M%S")
+    except (ValueError, TypeError):
+        stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    used = set()
+    for p in router_session_files():
+        used.add(session_header_id(p))
+        used.add(p.stem.split("_", 1)[-1])
+    arch = router_session_dir() / "archive"
+    if arch.exists():
+        for p in arch.glob("*.jsonl"):
+            used.add(session_header_id(p))
+    # 当前状态里的 id 也算「已用」—— 同一秒内连着轮转两次不会撞回同一个 id
+    used.add(str(load_session_state().get("session_id") or ""))
+    sid = f"{SESSION_ID_PREFIX}-{stamp}"
+    n = 0
+    while sid in used:
+        n += 1
+        if n > 120:
+            sid = f"{SESSION_ID_PREFIX}-{stamp}-{int(time.time())}"
+            break
+        sid = f"{SESSION_ID_PREFIX}-{stamp}-{n:02d}"
+    return sid
+
+
+def load_session_state() -> dict:
+    st = {}
+    if SESSION_ID_FILE.exists():
+        try:
+            st = json.loads(SESSION_ID_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            st = {}
+    return st if isinstance(st, dict) else {}
+
+
+def save_session_state(st: dict) -> None:
+    """落盘 session 状态（原子替换：崩在半路不会读到半个文件）。"""
+    SESSION_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SESSION_ID_FILE.with_name(SESSION_ID_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(SESSION_ID_FILE)
+
+
+def current_session_state() -> dict:
+    """当前 router session 的状态（id / 创建时间 / 显示名）。
+
+    状态文件是**唯一权威**：
+      · router 重启 → 读同一个 id → pi 复现同一会话（上下文不丢）
+      · 轮转 → 换一个全新 id → pi 开新会话（上下文清零），老会话留在 archive/
+
+    状态文件不存在时（首次上线 / 被误删）：认领顶层已有的最新 router 会话，
+    别把正在跑的上下文弄丢。
+    """
+    st = load_session_state()
+    sid = str(st.get("session_id") or "").strip()
+    if sid:
+        st.setdefault("created_at", now())
+        st.setdefault("name", session_display_name(st["created_at"]))
+        return st
+    cands = router_session_files()
+    if cands:
+        p = cands[0]
+        created = (session_header_time(p)
+                   or _dt.datetime.fromtimestamp(p.stat().st_mtime).astimezone().isoformat(timespec="seconds"))
+        sid = session_header_id(p) or make_session_id(created)
+        st = {"session_id": sid, "created_at": created,
+              "name": session_display_name(created), "adopted_from": p.name}
+        save_session_state(st)
+        return st
+    created = now()
+    st = {"session_id": make_session_id(created), "created_at": created,
+          "name": session_display_name(created)}
+    save_session_state(st)
+    return st
+
+
+def wait_pid_gone(pid: int, timeout: float = 15.0) -> bool:
+    """等进程真的退出（stop 只是发信号）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def render_worker_brief() -> str:
+    """从 registry.json 生成 worker 名册。
+
+    名册只讲**谁是谁、能干什么、有什么闸门** ——
+    具体事项怎么做是 worker 自己的角色规格（role_prompt / ROLE.md）的事，
+    router 不写、不猜、不复述。
+    """
+    try:
+        data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    workers = data.get("workers") or []
+    lines = [
+        "# Worker 名册（本 session 启动时从 registry.json 生成）",
+        "",
+        "`agentId` 只能填下表里的 agent_id。名册与 registry 不一致时以 registry 为准。",
+        "",
+        "**你只带目标，不带做法。** 怎么做、拆成几步、交付成什么样、怎么验收 —— "
+        "全是 worker 自己的判断；worker 有自己的角色规格，你不用替它设计步骤。",
+        "",
+    ]
+    if not workers:
+        lines += ["（registry.json 读不到，先别派工。）", ""]
+        return "\n".join(lines)
+    lines += [
+        "| agent_id | 角色 | 只读 | 职责范围 | 触发闸门 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    disabled: list[str] = []
+    for w in workers:
+        aid = str(w.get("agent_id") or "")
+        if not aid:
+            continue
+        if not w.get("enabled"):
+            disabled.append(f"- `{aid}`（{w.get('label') or ''}）已停用："
+                            f"{w.get('disabled_reason') or '未说明'} —— **不要派它**")
+            continue
+        gate = w.get("trigger_gate") or {}
+        if gate:
+            gate_s = "有（Task Center 强制校验，闸门不符直接拒这条 item）"
+            if gate.get("require_p2p"):
+                gate_s += "；只对指定说话人的私聊开放"
+        else:
+            gate_s = "无"
+        scope = "、".join(str(a) for a in (w.get("accepts") or [])) or "（未声明）"
+        lines.append(f"| `{aid}` | {w.get('label') or ''} | "
+                     f"{'是' if w.get('readonly') else '否'} | {scope} | {gate_s} |")
+    lines += [
+        "",
+        "## 通用约定",
+        "",
+        "- 只读 worker（调查 / 方案类）由框架强制：不能改、删、建任何业务文件。",
+        "- 有触发闸门的 worker：闸门不符时 Task Center 直接拒这条 item；"
+        "你不用自己拦，但**不要**把这类请求硬派给别的 worker 做 —— "
+        "闸门不符时用 outbox 回一句说明就行。",
+        "- 名册里没有的 agent_id 一律不能填（registry 校验会拒）。",
+    ]
+    if disabled:
+        lines += ["", "## 已停用", ""] + disabled
+    return "\n".join(lines) + "\n"
+
+
+def write_worker_brief() -> pathlib.Path:
+    """生成 worker 名册文件（每个新 session 启动时重生成）。"""
+    try:
+        WORKER_BRIEF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WORKER_BRIEF_FILE.write_text(render_worker_brief(), encoding="utf-8")
+    except OSError as e:
+        log(f"worker 名册生成失败：{e}")
+    return WORKER_BRIEF_FILE
 
 
 # ------------------------------------------------------------------ prompt
@@ -173,11 +420,37 @@ def build_prompt(ev: dict) -> str:
         lines.append("")
         lines.append("用户说：")
         lines.append((ev.get("text") or "").strip())
+        lines.append("")
+        lines.append("→ 派工时把这段**原话**原样带给 worker（框架会自动放进指派单的「## 用户原话」）；"
+                     "需求分析、怎么做、怎么验收由 worker 自己判断，**不要替用户拆解**。")
         return "\n".join(lines)
     if task:
         lines.append(f"任务: {task}" + (f" / {asg}" if asg else ""))
         lines.append(f"目录: {sa.task_dir(task)}")
     if kind in ("assignment.completed", "assignment.failed") and task and asg:
+        # ── 分层产出：先给摘要，router 默认**不用**读产出全文 ──
+        status = ev.get("status") or ""
+        summ = (ev.get("summary") or "").strip()
+        fields = ev.get("summary_fields") or {}
+        arts = ev.get("artifacts") or []
+        if ev.get("auto_approved"):
+            lines.append(f"状态: {status}（**框架已自动放行**：产出 {len(arts)} 个文件均存在、回执结构完整）")
+            lines.append("→ 不用为此去读 response.md / task.md / 产出物；"
+                         "要知道细节看下面的摘要即可。")
+        else:
+            lines.append(f"状态: {status}")
+            if ev.get("review_note"):
+                lines.append(f"⚠ 框架复核未通过：{ev.get('review_note')} → 需要你决定（补证据 / 打回 / 问人）")
+        if summ:
+            lines.append(f"摘要: {summ}")
+            if fields.get("问题") and fields.get("问题") not in ("无", "-", "none"):
+                lines.append(f"⚠ 问题: {fields['问题']}")
+            if arts:
+                lines.append("产出: " + "、".join(str(a) for a in arts))
+            if ev.get("auto_replied"):
+                lines.append("worker 已自己写好回话，框架**已直接投给用户** —— "
+                             "不必再重复回话，除非要补充说明。")
+            lines.append("（默认只看摘要；除非要核对数字，否则不要去读产出文件。）")
         # 本批兄弟指派：同一句用户消息派出去的其它活。
         # router 用它判断「还有几条在跑」——
         #   还有在跑的 → 这次只复核放行，回报等齐了统一发（系统会合并成一条）；
@@ -207,9 +480,10 @@ def build_prompt(ev: dict) -> str:
 class PiSession:
     """一个常驻的 pi RPC 进程 = 一个常驻 session。"""
 
-    def __init__(self, cwd: pathlib.Path, session_id: str = SESSION_ID):
+    def __init__(self, cwd: pathlib.Path, session_id: str = ""):
         self.cwd = cwd
-        self.session_id = session_id
+        self.session_id = session_id or current_session_state().get("session_id") or SESSION_ID_PREFIX
+        self.session_created_at = ""
         self.proc: subprocess.Popen | None = None
         self.pending: dict[str, dict] = {}
         self.events: list[dict] = []
@@ -228,25 +502,36 @@ class PiSession:
         self.thinking = str(mst.get("thinking") or DEFAULT_THINKING).strip().lower()
         if self.thinking not in THINKING_LEVELS:
             self.thinking = DEFAULT_THINKING
-        # 会话名带上开启时间 —— `pi --resume` 的会话列表按 display name 展示，
-        # 名字固定的话历次会话长得一模一样，分不清哪次是哪次。
+        # 会话身份来自**持久化状态**：id 带创建时间（super-agent-router-<时间戳>），
+        # 重启后读同一个 id → pi 复现同一会话 → 上下文不丢；
+        # 轮转时换新 id → pi 开新会话。
+        st = current_session_state()
+        self.session_id = st.get("session_id") or self.session_id
         self.started_at = now()
-        self.session_name = f"Super Agent Router {self.started_at[:19].replace('T', ' ')}"
+        self.session_created_at = st.get("created_at") or self.started_at
+        self.session_name = st.get("name") or session_display_name(self.session_created_at)
+        # worker 名册：每个新 session 启动时从 registry.json 重新生成
+        brief = write_worker_brief()
         cmd = [
             "pi", "--mode", "rpc",
             "--session-id", self.session_id,
-            "--name", self.session_name,
             "--model", self.model,
             # 思考等级：router 只做语义判断，不需要长链推理；
             # 高档位实测会在第一次工具调用前空转 23 秒。
             "--thinking", self.thinking,
             "--append-system-prompt", str(SYSTEM_PROMPT_FILE),
+            # worker 名册：每个新 session 启动时从 registry.json 重新生成
+            "--append-system-prompt", str(brief),
             # 工具最小集：只读任务上下文 + 写 Decision 草稿 + 调 Task Center。
             # grep/find/ls 等探索工具一律不给 —— router 不做调查。
             "--tools", "read,write,bash",
             # 护栏：bash 只许 sa.py，read 只许任务目录，write 只许 /tmp
             "--extension", str(GATE_FILE),
         ]
+        # display name 只在**新建**会话时写一次；复现旧会话时别再 append 一条同名 session_info
+        if not session_file_for(self.session_id):
+            cmd += ["--name", self.session_name]
+        log(f"system prompt 注入：契约 {SYSTEM_PROMPT_FILE.name} + worker 名册 {brief.name}")
         env = dict(os.environ)
         env.setdefault("PI_NO_UPDATE_CHECK", "1")
         env["SA_ACTOR"] = "router"   # 让 sa.py 知道这是常驻 router，不许建任务
@@ -374,7 +659,8 @@ class PiSession:
     def snapshot(self) -> dict:
         """抓一份 session 状态，写到 router/session.json 供看板展示。"""
         info = {"session_id": self.session_id, "cwd": str(self.cwd), "ts": now(),
-                "session_name": self.session_name, "started_at": self.started_at}
+                "session_name": self.session_name, "started_at": self.started_at,
+                "session_created_at": self.session_created_at}
         try:
             st = self.request("get_state", timeout=20) or {}
             info["model"] = (st.get("model") or {}).get("id")
@@ -970,28 +1256,44 @@ def cmd_start(a: argparse.Namespace) -> None:
 
 
 def cmd_rotate(a: argparse.Namespace) -> None:
-    """手动轮转 session：归档当前 session，重启 router 开一个干净的。
+    """手动轮转 session：归档当前 session，换一个全新 id，重启 router 开一个干净的。
 
     session 默认是**单一长驻**的（用户要求统一会话）。当它太大、响应变慢时，
     手动跑一次这个命令即可 —— 跨轮次连续性由 router/digest.md 承接。
 
+    轮转做三件事：
+      1. 先落**新的 session 状态**（换新 id）—— 万一崩在半路，状态也不会指向已归档的 id
+      2. 停 router（等它真的退出），把顶层所有 router session 文件挪进 archive/
+      3. 重启 router → pi 按新 id 开一个干净的会话
+
     注意：轮转会丢掉未处理的旧上下文（摘要还在），轮转前先确认没有在跑的轮次。
     """
-    # pi 的 session 目录名由 cwd 推导（"/" → "-"），不能写死本机路径
-    sess_dir = pathlib.Path(os.path.expanduser(
-        "~/.pi/agent/sessions")) / ("--" + str(REPO).strip("/").replace("/", "-") + "--")
+    st = current_session_state()
+    old_sid = st.get("session_id") or ""
+    created = now()
+    new_sid = make_session_id(created)
+    # 先换状态再归档：状态永远指向「还没开、即将开」的那个 id
+    save_session_state({
+        "session_id": new_sid,
+        "created_at": created,
+        "name": session_display_name(created),
+        "rotated_at": created,
+        "previous_session_id": old_sid,
+    })
+    # 停 router（等它退出，否则它会继续往即将被归档的文件里写）
+    cmd_stop(argparse.Namespace())
+    # 清掉去重账本里的旧事件？不去 —— 事件去重要跨 session 保持，
+    # 否则旧事件会被重放。轮转只影响模型上下文，不影响事件账本。
+    sess_dir = router_session_dir()
     arch = sess_dir / "archive"
     arch.mkdir(parents=True, exist_ok=True)
     moved = []
-    for f in sess_dir.glob(f"*{SESSION_ID}*.jsonl"):
+    for f in sess_dir.glob(f"*{SESSION_ID_PREFIX}*.jsonl"):
         shutil.move(str(f), str(arch / f.name))
         moved.append(f.name)
-    # 清掉去重账本里的旧事件？不去 —— 事件去重要跨 session 保持，
-    # 否则旧事件会被重放。轮转只影响模型上下文，不影响事件账本。
-    cmd_stop(argparse.Namespace())
-    time.sleep(1.5)
+    # 起新 router → 它读新状态 → pi 按新 id 开新会话
     cmd_start(argparse.Namespace())
-    print(f"session 已轮转：归档 {len(moved)} 个文件")
+    print(f"session 已轮转：{old_sid} → {new_sid}，归档 {len(moved)} 个文件")
     for m in moved:
         print(f"  → archive/{m}")
     print(f"连续性由 {DIGEST_FILE} 承接（{len(read_digest(100).splitlines())} 行摘要）")
@@ -1053,12 +1355,11 @@ def cmd_rename_sessions(a: argparse.Namespace) -> None:
     「Super Agent Router」，在列表里分不清哪次是哪次。文件名前缀带 UTC 时间戳，
     据此回填成「Super Agent Router <本地时间>」。
     """
-    sess_dir = pathlib.Path(os.path.expanduser(
-        "~/.pi/agent/sessions")) / ("--" + str(REPO).strip("/").replace("/", "-") + "--")
-    files = list(sess_dir.glob(f"*{SESSION_ID}*.jsonl"))
+    sess_dir = router_session_dir()
+    files = list(sess_dir.glob(f"*{SESSION_ID_PREFIX}*.jsonl"))
     arch = sess_dir / "archive"
     if arch.exists():
-        files += list(arch.glob(f"*{SESSION_ID}*.jsonl"))
+        files += list(arch.glob(f"*{SESSION_ID_PREFIX}*.jsonl"))
     renamed = 0
     for f in files:
         lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1099,6 +1400,9 @@ def cmd_stop(a: argparse.Namespace) -> None:
         except OSError as e:
             log(f"停止失败: {e}")
         PID_FILE.unlink(missing_ok=True)
+        # 等它真的退出：归档 session 文件时它还在写的话，会写进已归档的文件
+        if not wait_pid_gone(pid):
+            log(f"router pid={pid} 15s 内没退出（可能在跑长任务）")
     else:
         print("未在运行")
 
@@ -1129,8 +1433,11 @@ def cmd_status(a: argparse.Namespace) -> None:
         except (json.JSONDecodeError, OSError):
             pass
     mst = load_model_state()
+    sst = current_session_state()
     print(json.dumps({
-        "running": running, "pid": pid, "session_id": SESSION_ID,
+        "running": running, "pid": pid, "session_id": sst.get("session_id"),
+        "session_created_at": sst.get("created_at"),
+        "session_name": sst.get("name"),
         "model": {"primary": mst.get("primary"), "active": mst.get("active"),
                   "degraded": mst.get("degraded"), "degraded_to": mst.get("degraded_to"),
                   "degraded_at": mst.get("degraded_at"),

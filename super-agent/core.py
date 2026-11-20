@@ -263,12 +263,25 @@ def validate_decision(doc: dict, *, allowed_triggers: list[str] | None = None,
 
 
 def render_instruction(*, task_id: str, assignment_id: str, agent_id: str,
-                       goal: str, requirements: list[str], acceptance: list[str],
+                       goal: str,
                        context_files: list[str], background: str = "",
                        trigger_id: str = "", readonly: bool = False,
-                       response_path: str = "") -> str:
-    """统一渲染指派单信封。router 只提供 goal / requirements / acceptance。"""
+                       response_path: str = "",
+                       user_text: str = "", user_text_note: str = "",
+                       mode: str = "full") -> str:
+    """统一渲染指派单信封。
+
+    router 只提供 **goal（用户原话或忠实转述）** ——
+    怎么做、拆成几步、交付成什么样、怎么验收，全部由 worker 自己判断。
+    所以指派单里**没有「具体要求」「验收标准」小节**：worker 收到的是目标，不是方案。
+
+    mode:
+      * ``full``     —— 新 session（worker 没听过这套协议）：完整契约（边界 / 回执格式 / 完成策略）
+      * ``continue`` —— 延续同一 worker session：交互模式、边界、回执格式都在上一轮说过了，
+                        这里只写本轮增量（目标 / 回执写到哪）
+    """
     spec = worker_spec(agent_id) or {}
+    cont = mode == "continue"
     lines = [
         f"# 指派单 {assignment_id}",
         "",
@@ -279,6 +292,13 @@ def render_instruction(*, task_id: str, assignment_id: str, agent_id: str,
     ]
     if trigger_id:
         lines.append(f"- trigger: `{trigger_id}`")
+    if cont:
+        lines += [
+            "- 轮次: **延续指派**（同一 worker session 的后续一轮）",
+            "",
+            "> 交互模式、边界与回执格式与上一轮一致，这里只写本轮增量；"
+            "拿不准时以上一轮为准。",
+        ]
     lines += [
         "",
         "## 目标",
@@ -286,62 +306,86 @@ def render_instruction(*, task_id: str, assignment_id: str, agent_id: str,
         goal.strip(),
         "",
     ]
-    if background:
+    if user_text.strip():
+        lines += [
+            "## 用户原话",
+            "",
+            "（这是用户本人的话，**不要改写、不要替用户重新定义需求**；"
+            "怎么做、怎么验收由你决定）",
+            "",
+            user_text.strip(),
+            "",
+        ]
+        if user_text_note:
+            lines += [f"> {user_text_note}", ""]
+    if background and not cont:
         lines += ["## 背景", "", background.strip(), ""]
     if context_files:
         lines += ["## 输入材料（绝对路径，只读）", ""]
         lines += [f"- `{p}`" for p in context_files]
         lines += [""]
-    if requirements:
-        reqs = [str(r).strip() for r in requirements if str(r).strip()]
-        if reqs:
-            lines += ["## 具体要求", ""]
-            lines += [f"{i}. {r}" for i, r in enumerate(reqs, start=1)]
-            lines += [""]
-    if acceptance:
-        lines += ["## 验收标准", "", "- [ ] " + "\n- [ ] ".join(str(a).strip() for a in acceptance if str(a).strip()), ""]
-    lines += [
-        "## 边界（不要做这些）",
-        "",
-        "- 不要修改本指派单与 channels/ 目录之外的文件，除非上面明确授权",
-    ]
-    if readonly:
-        lines.append("- 你是只读角色：**绝对不要**修改、创建、删除任何业务文件")
-    lines += [
-        "- 不要替 router 做汇总或对外发消息",
-        "- 缺信息时不要猜：回执写 `status: waiting_user_input` 并提出具体问题",
-        "- 产出与回执中不要出现：同事姓名/工号/uid、他人或群的消息内容、内部接口与域名、"
-        "内部工单号/计划号、内部仓库名与库表名、SQL 片段；必要时用占位符（如 `<同事A>`、`<内部工单>`）代替。"
-        "需要细节就把细节写进产出文件，由用户自己打开",
-        "",
-        "## 回执要求",
-        "",
-        f"完成后把回执写到：`{response_path}`",
-        "",
-        "格式：",
-        "",
-        "```markdown",
-        "# 回执 " + assignment_id,
-        "",
-        "- assignment: `" + assignment_id + "`",
-        "- agent: `" + agent_id + "`",
-        "- status: `done`   # done | failed | blocked | waiting_user_input",
-        "- updated_at: <ISO8601>   # 这一行由系统盖章，worker 不用填",
-        "",
-        "## 结论",
-        "",
-        "（一句话：做了什么 + 结果是什么）",
-        "",
-        "## 产出",
-        "",
-        "- `/abs/path/产物.md`",
-        "```",
-        "",
-        "## 完成策略",
-        "",
-        "本任务按「目标 + 完成证据」判定完成：产出文件必须落盘并给出绝对路径。",
-        "",
-    ]
+    if not cont:
+        # 边界：只留**任务相关**的两条；通用纪律在 system prompt（prompts/INTERACTION.md）
+        lines += [
+            "## 边界（不要做这些）",
+            "",
+            "- 不要修改本指派单与本任务目录（`tasks/<id>/`）之外的文件，除非上面明确授权",
+        ]
+        if readonly:
+            lines.append("- 你是只读角色：**绝对不要**修改、创建、删除任何业务文件")
+        lines += [
+            "",
+            "## 回执要求",
+            "",
+            f"完成后把回执写到：`{response_path}`",
+            "",
+            "格式：",
+            "",
+            "```markdown",
+            "# 回执 " + assignment_id,
+            "",
+            "- assignment: `" + assignment_id + "`",
+            "- agent: `" + agent_id + "`",
+            "- status: `done`   # done | failed | blocked | waiting_user_input",
+            "- updated_at: <ISO8601>   # 这一行由系统盖章，worker 不用填",
+            "",
+            "## 摘要",
+            "",
+            "产出：/abs/path/产物.md      # 有就写路径，没有写「无」",
+            "已回话：否                   # 你是否已经自己回复过用户了",
+            "问题：无                     # 有就写清楚卡在哪，没有写「无」",
+            "（可选）一句话补充",
+            "",
+            "## 结论",
+            "",
+            "（一句话：做了什么 + 结果是什么）",
+            "",
+            "## 产出",
+            "",
+            "- `/abs/path/产物.md`",
+            "",
+            "## 回话",
+            "",
+            "（可选）给用户看的话 —— 写了框架会**直接投递**，不用 router 再转述；不写就不投递",
+            "```",
+            "",
+            "## 完成策略",
+            "",
+            "本任务按「目标 + 完成证据」判定完成：产出文件必须落盘并给出绝对路径。",
+            "",
+        ]
+    else:
+        # 延续轮：回执只说清「写哪、状态有哪些、格式沿用上一轮」
+        lines += [
+            "## 回执要求",
+            "",
+            f"完成后把回执写到：`{response_path}`",
+            "",
+            "- 格式与上一轮**完全一致**（`# 回执 <id>` + status / 结论 / 产出 绝对路径）",
+            "- `status` 取值：`done` | `failed` | `blocked` | `waiting_user_input`",
+            "- 缺信息不要猜：写 `waiting_user_input` 并提出具体问题",
+            "",
+        ]
     return "\n".join(lines)
 
 

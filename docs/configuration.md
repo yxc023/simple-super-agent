@@ -49,7 +49,7 @@ cp super-agent/registry.example.json    super-agent/registry.json
 
 | 变量 | 作用 |
 | --- | --- |
-| `SA_ROOT` | **状态根**。不设 = 生产（代码目录）；指到临时目录即为沙箱演练，`tasks/` `channels/` `outbox/` 都不会写进生产 |
+| `SA_ROOT` | **状态根**。不设 = 生产（代码目录）；指到临时目录即为沙箱演练，`tasks/` `outbox/` 都不会写进生产 |
 | `SA_TASKS_DIR` / `SA_CHANNELS_DIR` / `SA_INBOX_DIR` / `SA_OUTBOX_DIR` | 单个状态目录覆盖（优先级高于 `SA_ROOT`） |
 | `SA_POLICY_FILE` | 策略文件路径覆盖（自检与演练用） |
 | `SA_ACTOR` | 调用者身份（如 `router`）。router 进程不允许自行新建任务 |
@@ -75,7 +75,7 @@ python3 super-agent/sync_skill.py --check    # 生成物与同步目标是否一
 
 | 路径 | 原因 |
 | --- | --- |
-| `super-agent/tasks/` `channels/` `outbox/` `inbox/` `router/` | 运行期账本：真实任务、指派、消息正文、回执 |
+| `super-agent/tasks/` `outbox/` `inbox/` `router/` | 运行期账本：真实任务、指派、消息正文、回执 |
 | `super-agent/lark_state.json` | 飞书消息去重状态，含消息 id 与内容片段 |
 | `super-agent/lark_config.json` `policy.json` `registry.json` | app_id / open_id / 群 id / 人员目录 |
 | `logs/` | 个人工作日志，含会话 id、群 id、同事姓名 |

@@ -83,6 +83,20 @@ def _read(path: pathlib.Path, limit: int = 4000) -> str:
         return ""
 
 
+def _assignment_file(tid: str, aid: str, kind: str) -> tuple[pathlib.Path, str]:
+    """指派文件路径（新布局优先，旧布局兜底）。
+
+    kind: "instruction" | "response"
+    新：tasks/<tid>/assignments/<aid>/<kind>.md
+    旧：channels/<tid>/{instructions,responses}/<aid>.md
+    """
+    new = ROOT / "tasks" / tid / "assignments" / aid / f"{kind}.md"
+    legacy = ROOT / "channels" / tid / ("instructions" if kind == "instruction" else "responses") / f"{aid}.md"
+    if new.exists() or not legacy.exists():
+        return new, f"tasks/{tid}/assignments/{aid}/{kind}.md"
+    return legacy, f"channels/{tid}/{'instructions' if kind == 'instruction' else 'responses'}/{aid}.md"
+
+
 def _iso(v) -> str:
     """epoch / ISO 字符串 → 统一成 '2026-11-19T11:15:14+08:00'。
 
@@ -192,6 +206,41 @@ def _sender_names() -> dict:
     return {s.get("open_id"): s.get("name") for s in cfg.get("senders") or [] if s.get("open_id")}
 
 
+def _router_session_file() -> pathlib.Path | None:
+    """当前 router session 文件 —— 只认**活着**的那个。
+
+    归档（archive/）里的是历史会话，不能当现行：
+    早先这里用 rglob + 「后写覆盖」匹配，归档文件排在后面就会把当前会话顶掉，
+    看板上的「router session 命中」会指向一个早就归档的旧会话。
+    """
+    # 1) 运行中的 router 自己把 session_file 写进 snapshot
+    try:
+        sj = json.loads((sa.ROUTER_DIR / "session.json").read_text(encoding="utf-8"))
+        p = pathlib.Path(str(sj.get("session_file") or ""))
+        if p.name and p.exists():
+            return p
+    except (OSError, ValueError):
+        pass
+    # 2) 兜底：状态文件里的 id → 顶层文件
+    sid = ""
+    try:
+        st = json.loads((sa.ROUTER_DIR / "session_id.json").read_text(encoding="utf-8"))
+        sid = str(st.get("session_id") or "")
+    except (OSError, ValueError):
+        pass
+    base = pathlib.Path.home() / ".pi" / "agent" / "sessions"
+    if sid and base.exists():
+        cands = [p for p in base.rglob(f"*_{sid}.jsonl") if "archive" not in p.parts]
+        if cands:
+            return max(cands, key=lambda p: p.stat().st_mtime)
+    # 3) 再兜底：非归档里最新那个 router 会话
+    if base.exists():
+        cands = [p for p in base.rglob("*super-agent-router*.jsonl") if "archive" not in p.parts]
+        if cands:
+            return max(cands, key=lambda p: p.stat().st_mtime)
+    return None
+
+
 def _session_files() -> dict:
     """worker_session_id / 会话文件名 → pi session 文件路径（30s 缓存：目录遍历最贵）。"""
     now = time.time()
@@ -200,12 +249,16 @@ def _session_files() -> dict:
     out: dict = {}
     base = pathlib.Path.home() / ".pi" / "agent" / "sessions"
     if base.exists():
-        for p in base.rglob("*.jsonl"):
+        # 非归档优先、其次新的优先；同一 token 只认第一个（最新的非归档文件）
+        files = sorted(base.rglob("*.jsonl"),
+                       key=lambda p: ("archive" in p.parts, -p.stat().st_mtime))
+        for p in files:
             name = p.name
             for token in re.findall(r"(w-T\d+-A\d+-[A-Za-z0-9._-]+)", name):
-                out[token] = p
-            if name.endswith("_super-agent-router.jsonl"):
-                out["__router__"] = p
+                out.setdefault(token, p)
+        rf = _router_session_file()
+        if rf:
+            out["__router__"] = rf
     _SESSION_CACHE["at"] = now
     _SESSION_CACHE["data"] = out
     return out
@@ -369,18 +422,20 @@ def _build_one(msg: dict, idx: dict, include_raw: bool = False) -> dict:
                      f"摘要 {(a.get('brief') or '')[:120]}"]
             if sess:
                 lines.append(f"worker session {sess.name}")
+            instr_path, instr_label = _assignment_file(tid, aid, "instruction") if aid else (None, "")
+            resp_path, resp_label = _assignment_file(tid, aid, "response") if aid else (None, "")
             stages.append(_stage(
                 "assign", _iso(a.get("dispatched_at")), f"指派 {aid} → {a.get('worker')}",
                 lines,
-                raw=(_read(ROOT / "channels" / tid / "instructions" / f"{aid}.md") if aid else ""),
-                raw_label=f"channels/{tid}/instructions/{aid}.md", scope="task"))
+                raw=(_read(instr_path) if instr_path else ""),
+                raw_label=instr_label, scope="task"))
             if aid:
-                resp = _read(ROOT / "channels" / tid / "responses" / f"{aid}.md", 3000)
+                resp = _read(resp_path, 3000)
                 if resp:
                     stages.append(_stage(
                         "worker", _iso(a.get("completed_at")), f"回执 {aid}",
                         [ln for ln in resp.splitlines()[:8] if ln.strip()],
-                        raw=resp, raw_label=f"channels/{tid}/responses/{aid}.md", scope="task"))
+                        raw=resp, raw_label=resp_label, scope="task"))
 
     # 外发回话
     obs = list(idx["outbox_by_reply"].get(mid, []))

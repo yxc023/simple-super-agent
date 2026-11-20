@@ -41,7 +41,7 @@ def artifacts_from_response(path: str) -> list[str]:
     与 worker_runner 同源，但多一道过滤 —— 回执里常出现这种句子：
         「无（未落盘任何交付文件）；本回执仅为 `.../responses/A03.md`」
     这里的回执路径**不是交付物**，把它登记成 artifact 等于凭空造证据。
-    所以排除：回执自身、指派单、以及 channels/ 下的基础设施路径。
+    所以排除：回执自身、指派单、以及框架自身的基础设施路径。
     """
     out: list[str] = []
     p = pathlib.Path(path)
@@ -74,7 +74,7 @@ def _is_infra_path(cand: str) -> bool:
     结果会把自己的交付物也当成基础设施丢掉。改成按**路径成分**判定。
     """
     parts = pathlib.Path(cand).parts
-    infra = {"channels", "outbox", "inbox", "tasks", "router", "z-archive", "logs"}
+    infra = {"assignments", "outbox", "inbox", "tasks", "router", "z-archive", "logs"}
     return bool(infra.intersection(parts))
 
 

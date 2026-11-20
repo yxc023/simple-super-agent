@@ -47,7 +47,6 @@ pnpm-lock.yaml.bak
 # 需要留痕请用 `sa.py` 导出，或另建脱敏归档目录。
 # ---------------------------------------------------------------------------
 super-agent/tasks/
-super-agent/channels/
 super-agent/outbox/
 super-agent/inbox/
 super-agent/logs/

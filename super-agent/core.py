@@ -318,7 +318,8 @@ def render_instruction(*, task_id: str, assignment_id: str, agent_id: str,
         ]
         if user_text_note:
             lines += [f"> {user_text_note}", ""]
-    if background and not cont:
+    if background and not cont and background.strip() != goal.strip():
+        # 背景常常就是任务的目标（用户原话）——重复渲染没意义，只在真不一样时才有背景
         lines += ["## 背景", "", background.strip(), ""]
     if context_files:
         lines += ["## 输入材料（绝对路径，只读）", ""]

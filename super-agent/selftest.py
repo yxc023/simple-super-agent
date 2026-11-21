@@ -1698,6 +1698,8 @@ def main() -> None:
         check("指派单不再有「具体要求 / 验收标准」小节（做法归 worker）",
               all(s not in full_i for s in ("## 具体要求", "## 验收标准"))
               and all(s not in cont_i for s in ("## 具体要求", "## 验收标准")))
+        dup_i = core.render_instruction(**{**kw, "background": kw["goal"]})
+        check("背景与目标相同时不重复渲染「## 背景」", "## 背景" not in dup_i)
         check("延续 session 指派单仍写清回执路径与 status 枚举",
               "/tmp/x/response.md" in cont_i and "waiting_user_input" in cont_i)
         check("延续版比完整版短", len(cont_i) < len(full_i),
